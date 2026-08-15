@@ -1,4 +1,3 @@
-# daemon
 # daemon [![godoc](https://godoc.org/github.com/malivvan/daemon?status.svg)](https://godoc.org/github.com/malivvan/daemon) ![test](https://github.com/malivvan/daemon/workflows/test/badge.svg) [![Coverage Status](https://coveralls.io/repos/github/malivvan/daemon/badge.svg?branch=master)](https://coveralls.io/github/malivvan/daemon?branch=master) [![Release](https://img.shields.io/github/v/release/malivvan/daemon.svg?sort=semver)](https://github.com/malivvan/daemon/releases/latest) [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A small Go package for running a process in the background and for protecting shared resources with a pid-based lockfile.
