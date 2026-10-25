@@ -8,9 +8,105 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"strconv"
 	"syscall"
 	"unsafe"
 )
+
+// windowsDetachedProcess (DETACHED_PROCESS) starts the daemon without a console.
+// Hidden consoles expose CONIN$, which can make terminal-probing libraries block
+// forever when nothing is present to answer terminal queries.
+const windowsDetachedProcess = 0x00000008
+
+func detachChild(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.CreationFlags |= syscall.CREATE_NEW_PROCESS_GROUP | windowsDetachedProcess
+}
+
+// ProcessAlive reports whether pid appears to name a live process.
+func ProcessAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	const processQueryLimitedInformation = 0x1000
+	handle, err := syscall.OpenProcess(processQueryLimitedInformation, false, uint32(pid))
+	if err != nil {
+		return errors.Is(err, syscall.ERROR_ACCESS_DENIED)
+	}
+	defer func() { _ = syscall.CloseHandle(handle) }()
+
+	// A terminated process object remains openable while another handle keeps
+	// it alive. The exit status, not the handle alone, distinguishes that state.
+	const stillActive = 259
+	var exitCode uint32
+	if err := syscall.GetExitCodeProcess(handle, &exitCode); err != nil {
+		return true
+	}
+	return exitCode == stillActive
+}
+
+// processTerminate is the access right required to end a process.
+const processTerminate = 0x0001
+
+func killProcess(pid int) error {
+	handle, err := syscall.OpenProcess(processTerminate, false, uint32(pid))
+	if err != nil {
+		return fmt.Errorf("open process %d: %w", pid, err)
+	}
+	defer func() { _ = syscall.CloseHandle(handle) }()
+
+	// Exit code 1 matches os.Process.Kill, so an externally terminated daemon is
+	// not mistaken for one that exited successfully.
+	if err := syscall.TerminateProcess(handle, 1); err != nil {
+		return fmt.Errorf("kill process %d: %w", pid, err)
+	}
+	return nil
+}
+
+// publishFile renames staging over target with MoveFileEx, which replaces an
+// existing file and writes the rename through. It never copies, so a rename
+// across volumes fails.
+func publishFile(staging, target string) error {
+	return moveFileEx(staging, target, moveFileReplaceExisting|moveFileWriteThrough)
+}
+
+// syncDir is a no-op on Windows: a directory handle cannot be fsynced to force
+// entry changes to disk, and renames are write-through.
+func syncDir(string) error { return nil }
+
+// errorLockViolation is returned by LockFileEx when the lock is held and
+// LOCKFILE_FAIL_IMMEDIATELY is set.
+const errorLockViolation syscall.Errno = 33
+
+// lockFilePlatform takes an exclusive LockFileEx lock on file. With
+// nonblocking it reports false instead of waiting when another holder has the
+// lock.
+func lockFilePlatform(file *os.File, nonblocking bool) (bool, error) {
+	err := lockFileExclusive(syscall.Handle(file.Fd()), nonblocking)
+	if err == nil {
+		return true, nil
+	}
+	if nonblocking && (errors.Is(err, errorLockViolation) || errors.Is(err, syscall.ERROR_IO_PENDING)) {
+		return false, nil
+	}
+	return false, err
+}
+
+func unlockFilePlatform(file *os.File) error {
+	return unlockFileEx(syscall.Handle(file.Fd()))
+}
+
+// wsaECONNREFUSED is WSAECONNREFUSED, which Windows reports both for a socket
+// file with no listener and for a missing path; neither maps to
+// syscall.ECONNREFUSED.
+const wsaECONNREFUSED syscall.Errno = 10061
+
+func isStaleUnixSocketDialError(err error) bool {
+	return errors.Is(err, wsaECONNREFUSED)
+}
 
 // ensurePrivateRuntimeDir creates path when needed and verifies it is a
 // non-reparse directory owned by the current token user, token owner,
@@ -137,6 +233,48 @@ func runtimeUID() string {
 	}
 	sum := sha256.Sum256([]byte(str))
 	return "sid-" + hex.EncodeToString(sum[:8])
+}
+
+// processQueryLimitedInformation opens a process with the least access that
+// still allows its creation time to be read.
+const processQueryLimitedInformation = 0x1000
+
+// ReadProcessIdentity returns pid's OS-reported creation time as an opaque
+// identity. ok is false when pid is gone or its creation time cannot be read.
+func ReadProcessIdentity(pid int) (ProcessIdentity, bool) {
+	if pid <= 0 {
+		return "", false
+	}
+	handle, err := syscall.OpenProcess(processQueryLimitedInformation, false, uint32(pid))
+	if err != nil {
+		return "", false
+	}
+	defer func() { _ = syscall.CloseHandle(handle) }()
+	var creation, exit, kernel, user syscall.Filetime
+	if err := syscall.GetProcessTimes(handle, &creation, &exit, &kernel, &user); err != nil {
+		return "", false
+	}
+	// Unix milliseconds, the same encoding the previous Unix-based lookup used,
+	// so identities recorded by older versions stay comparable.
+	millis := creation.Nanoseconds() / 1e6
+	if millis <= 0 {
+		return "", false
+	}
+	return ProcessIdentity(strconv.FormatInt(millis, 10)), true
+}
+
+// processIdentityScope is ProcessScopeLocal for a readable identity whatever
+// pid: Windows identities carry no boot ID or namespace.
+func processIdentityScope(_ int, identity ProcessIdentity) ProcessScope {
+	if !processIdentityCompatible(identity) {
+		return ProcessScopeUnknown
+	}
+	return ProcessScopeLocal
+}
+
+func runtimeProcessIdentities(pid int) (ProcessIdentity, ProcessIdentity) {
+	identity, _ := ReadProcessIdentity(pid)
+	return identity, ""
 }
 
 func currentWindowsTokenSIDs() (userSID, ownerSID *winSID, err error) {

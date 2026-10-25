@@ -1,4 +1,4 @@
-//go:build unix
+//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd
 
 package daemon
 
@@ -6,9 +6,92 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"syscall"
 )
+
+func detachChild(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setsid = true
+}
+
+// ProcessAlive reports whether pid appears to name a live process.
+func ProcessAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = process.Signal(syscall.Signal(0))
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+func killProcess(pid int) error {
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("find process %d: %w", pid, err)
+	}
+	if err := process.Signal(os.Kill); err != nil {
+		return fmt.Errorf("kill process %d: %w", pid, err)
+	}
+	return nil
+}
+
+// publishFile renames staging over target, atomically replacing an existing
+// file. It never copies, so a rename across volumes fails.
+func publishFile(staging, target string) error {
+	return os.Rename(staging, target)
+}
+
+// syncDir fsyncs dir so a rename or new file survives a crash. POSIX allows
+// opening a directory read-only and syncing the resulting descriptor.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open directory %s for sync: %w", dir, err)
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil {
+		return fmt.Errorf("sync directory %s: %w", dir, syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close directory %s after sync: %w", dir, closeErr)
+	}
+	return nil
+}
+
+// lockFilePlatform takes an exclusive flock lock on file. With nonblocking it
+// reports false instead of waiting when another holder has the lock.
+func lockFilePlatform(file *os.File, nonblocking bool) (bool, error) {
+	how := syscall.LOCK_EX
+	if nonblocking {
+		how |= syscall.LOCK_NB
+	}
+	err := syscall.Flock(int(file.Fd()), how)
+	if err == nil {
+		return true, nil
+	}
+	if nonblocking && (errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN)) {
+		return false, nil
+	}
+	return false, err
+}
+
+func unlockFilePlatform(file *os.File) error {
+	return syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+}
+
+// isStaleUnixSocketDialError reports whether err means the socket path has no
+// listener.
+func isStaleUnixSocketDialError(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT)
+}
 
 // ensurePrivateRuntimeDir creates path when needed and verifies it is a
 // non-symlink directory owned by the current user with mode 0700.

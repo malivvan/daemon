@@ -1,13 +1,28 @@
-//go:build darwin
+//go:build darwin || dragonfly || freebsd || netbsd || openbsd
 
 package daemon
 
 import (
 	"math"
+	"runtime"
 	"strconv"
 	"syscall"
 	"unsafe"
 )
+
+// processIdentityScope is ProcessScopeLocal for a readable identity whatever
+// pid: non-Linux identities carry no boot ID or namespace.
+func processIdentityScope(_ int, identity ProcessIdentity) ProcessScope {
+	if !processIdentityCompatible(identity) {
+		return ProcessScopeUnknown
+	}
+	return ProcessScopeLocal
+}
+
+func runtimeProcessIdentities(pid int) (ProcessIdentity, ProcessIdentity) {
+	identity, _ := ReadProcessIdentity(pid)
+	return identity, ""
+}
 
 // Darwin's kern.proc.pid sysctl returns a kinfo_proc whose first field is the
 // process start time. Reading only that prefix keeps the package free of the
@@ -30,8 +45,16 @@ type darwinTimeval struct {
 }
 
 // ReadProcessIdentity returns pid's OS-reported creation time as an opaque
-// identity. ok is false when pid is gone or its start time cannot be read.
+// identity. Only Darwin can inspect it on this build; every other platform
+// keeps the identity unknown, which never authorizes destructive action.
 func ReadProcessIdentity(pid int) (ProcessIdentity, bool) {
+	if runtime.GOOS != "darwin" {
+		return "", false
+	}
+	return readDarwinProcessIdentity(pid)
+}
+
+func readDarwinProcessIdentity(pid int) (ProcessIdentity, bool) {
 	if pid <= 0 || pid > math.MaxInt32 {
 		return "", false
 	}

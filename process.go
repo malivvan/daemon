@@ -1,6 +1,10 @@
 package daemon
 
-import "os"
+import (
+	"fmt"
+	"os"
+	"strconv"
+)
 
 // ProcessIdentity is an opaque OS process-creation identity. Values are only
 // meaningful for exact comparison against the live process holding a PID.
@@ -130,4 +134,27 @@ func runtimeRecordBlocksStart(rec RuntimeRecord, scope ProcessScope) bool {
 // mismatch. Discover uses it to pick records worth probing.
 func runtimeRecordLive(rec RuntimeRecord) bool {
 	return RuntimeProcessAlive(rec) && CompareRuntimeProcessIdentity(rec) != ProcessIdentityMismatch
+}
+
+// processIdentityCompatible reports whether identity is a canonical positive
+// decimal value, the only shape platforms without versioned identities emit.
+func processIdentityCompatible(identity ProcessIdentity) bool {
+	encoded := string(identity)
+	value, err := strconv.ParseInt(encoded, 10, 64)
+	return err == nil && value > 0 && strconv.FormatInt(value, 10) == encoded
+}
+
+// Kill terminates pid immediately, without giving it a chance to clean up:
+// SIGKILL on Unix and TerminateProcess on Windows.
+//
+// Kill only signals the PID the caller supplies; it does not verify the
+// process's creation identity first. A caller holding a RuntimeRecord must
+// establish that the live process is the recorded one (for example with
+// CompareRuntimeProcessIdentity) before calling Kill, because an unknown
+// identity never authorizes destructive action against a process.
+func Kill(pid int) error {
+	if pid <= 0 {
+		return fmt.Errorf("kill process: pid must be > 0: %d", pid)
+	}
+	return killProcess(pid)
 }

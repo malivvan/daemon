@@ -4,6 +4,7 @@ package daemon
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -11,6 +12,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestDetachChildStartsNewSession(t *testing.T) {
+	cmd := exec.CommandContext(t.Context(), "/bin/sh")
+	detachChild(cmd)
+
+	assert.True(t, cmd.SysProcAttr.Setsid, "child must start its own session")
+}
 
 func TestUnixSocketStaleTreatsMissingSocketAsStale(t *testing.T) {
 	dir, err := os.MkdirTemp("/tmp", "kitd-probe") //nolint:usetesting // unix socket paths must stay short, so the test needs a fixed OS temp root
