@@ -3,7 +3,6 @@ package daemon_test
 import (
 	"bufio"
 	"context"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -251,16 +250,12 @@ func TestCleanupDeadKeepsRecordWithUnjudgedIdentity(t *testing.T) {
 
 func TestDiscoverProbesRecordWithUnjudgedIdentity(t *testing.T) {
 	pid := deadPID(t)
-	server := httptest.NewServer(daemon.NewPingHandler(daemon.PingHandlerOptions{
-		Service: "tool",
-		PID:     pid,
-	}))
-	defer server.Close()
+	d := startTestDaemon(t, daemon.RuntimeRecord{PID: pid, Service: "tool"})
 	store := daemon.RuntimeStore{Dir: t.TempDir()}
 	_, err := store.Write(daemon.RuntimeRecord{
 		PID:               pid,
-		Network:           daemon.NetworkTCP,
-		Address:           listenerAddr(t, server),
+		Network:           d.endpoint.Network,
+		Address:           d.endpoint.Address,
 		Service:           "tool",
 		StartedAt:         time.Now(),
 		ProcessIdentityV2: "future-v1:12345",

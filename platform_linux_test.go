@@ -51,8 +51,9 @@ func TestStopUnjudgedIdentityWithDeadLocalPID(t *testing.T) {
 	pid := deadPID(t)
 	proof := newDaemonProof(t, []byte("stop-secret-key"))
 	rec := daemon.RuntimeRecord{PID: pid, Service: "test", ProcessIdentityV2: "future-v1:12345"}
-	server, rec := startProofServer(t, rec, proof)
-	defer server.Close()
+	d := startTestDaemonProof(t, rec, proof)
+	rec.Network = d.endpoint.Network
+	rec.Address = d.endpoint.Address
 	rec = storedStopRecord(t, rec)
 	requests := 0
 	err := daemon.Stop(t.Context(), rec, daemon.StopOptions{
@@ -61,7 +62,7 @@ func TestStopUnjudgedIdentityWithDeadLocalPID(t *testing.T) {
 		Request: func(_ context.Context, got daemon.RuntimeRecord) error {
 			assert.Equal(t, rec, got)
 			requests++
-			server.Close()
+			d.halt()
 			return nil
 		},
 	})

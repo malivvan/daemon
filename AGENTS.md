@@ -57,14 +57,19 @@ databases, command parsing, and shutdown policy belong to the caller.
   plain PID check.
 - Never send a bearer credential to a runtime-record endpoint before it proves
   possession of the daemon token and its recorded service, version, PID,
-  network, and address. Use the package proof ping and probe contract for this
-  ordering.
+  network, and address. Use the package's framed handshake proof contract for
+  this ordering.
+- The handshake is a length-prefixed binary message protocol over `net.Conn`.
+  The package must not depend on `net/http`. Each accepted connection runs a
+  `PingHandler` before application data; `Endpoint.Dialer` performs the same
+  handshake before returning a connection. Callers own the application
+  protocol that follows.
 - Default network behavior stays local. Do not add public listen addresses or
   broad bind behavior without an explicit caller option.
 - `Stop` runs the shutdown request only after `runtimeRecordLive` and the
   endpoint verify.
-  - TCP records require `Proof` in every process scope.
-  - Unix records may use a plain PID ping.
+  - `Proof` is used only when the caller provides it; otherwise the handshake
+    is a plain PID ping.
   - When set, only `Exited` confirms exit.
   - Otherwise, a refused connection or another PID answering ends the wait.
   - `Stop` removes no files.
@@ -115,7 +120,7 @@ databases, command parsing, and shutdown policy belong to the caller.
 
 ## Tests
 
-- Use local HTTP handlers, temporary dirs, and per-test runtime stores.
+- Use local listeners, temporary dirs, and per-test runtime stores.
 - Assert what a client observes: status code, response body, runtime record, or
   returned error.
 - Avoid timing assumptions. Prefer explicit locks, probes, and short contexts

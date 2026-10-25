@@ -172,16 +172,13 @@ func IsEphemeralExecutable(exe string) bool {
 	return strings.HasSuffix(lowerBase, ".test") || strings.Contains(normalized, "/go-build")
 }
 
-// ErrStopProofRequired means a TCP shutdown request needs endpoint proof.
-var ErrStopProofRequired = errors.New("daemon stop requires endpoint proof")
-
 // ErrExitUnconfirmed means the recorded process is gone but exit evidence is inconclusive.
 var ErrExitUnconfirmed = errors.New("daemon exit is unconfirmed")
 
 // StopOptions configures a shutdown request and the wait for daemon exit.
 type StopOptions struct {
 	Probe ProbeOptions
-	// Proof is required for TCP records in every process scope.
+	// Proof, when set, requires proof of possession before the shutdown request.
 	Proof *Proof
 	// Request asks the verified daemon to shut down.
 	// Its error ends Stop and is returned wrapped. Treat a connection dropped
@@ -197,7 +194,8 @@ type StopOptions struct {
 }
 
 // Stop verifies rec's endpoint, requests shutdown, and waits for exit.
-// TCP records require Proof in every process scope; Unix records may use a PID ping.
+// Proof is used when provided for any network; without it, the handshake is a
+// plain PID ping.
 // When rec's process is proven gone, Stop checks exit evidence without a request.
 // Without Exited, a stale Unix socket also confirms exit before any request.
 // A record with no versioned identity is judged local, as in Discover.
@@ -232,9 +230,6 @@ func Stop(ctx context.Context, rec RuntimeRecord, opts StopOptions) error {
 			return nil
 		}
 		return fmt.Errorf("stop daemon at %s: %w", ep.Address, ErrExitUnconfirmed)
-	}
-	if ep.Network != NetworkUnix && opts.Proof == nil {
-		return stopErrorUnlessExited(ctx, rec, opts, fmt.Errorf("stop daemon at %s: %w", ep.Address, ErrStopProofRequired))
 	}
 	info, err := probeRecordEndpoint(ctx, rec, opts.Proof, opts.Probe)
 	if err == nil && opts.Proof == nil && info.PID != rec.PID {

@@ -3,8 +3,8 @@ package daemon_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -55,41 +55,46 @@ func TestParseEndpointUnixDefault(t *testing.T) {
 	assert.Equal(t, "unix://"+socketPath, ep.ConfigAddress())
 }
 
-func TestUnixHTTPClientDialsSocket(t *testing.T) {
+func TestUnixDialerPerformsHandshake(t *testing.T) {
 	require := require.New(t)
 
-	socketDir, err := os.MkdirTemp("", "kitd") //nolint:usetesting // unix socket paths must stay short, so the test needs a fixed OS temp root
+	endpoint := daemon.Endpoint{Network: daemon.NetworkUnix, Address: unixSocketPath(t)}
+	listener, err := net.Listen("unix", endpoint.Address)
 	require.NoError(err)
-	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
-	socketPath := filepath.Join(socketDir, "daemon.sock")
-	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", socketPath)
-	require.NoError(err)
-	t.Cleanup(func() {
-		_ = listener.Close()
-		_ = os.Remove(socketPath)
+
+	ping := daemon.NewPingHandler(daemon.PingHandlerOptions{
+		Record: daemon.RuntimeRecord{PID: os.Getpid(), Service: "tool"},
 	})
+	handler := func(ctx context.Context, conn net.Conn) error {
+		if err := ping(ctx, conn); err != nil {
+			return err
+		}
+		request := make([]byte, 2)
+		if _, err := io.ReadFull(conn, request); err != nil {
+			return err
+		}
+		_, err := conn.Write([]byte("ok"))
+		return err
+	}
+	startTestHandler(t, listener, endpoint, handler)
 
-	server := http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, "ok")
-	})}
-	go func() { _ = server.Serve(listener) }()
-	t.Cleanup(func() { _ = server.Shutdown(context.WithoutCancel(t.Context())) })
-
-	ep := daemon.Endpoint{Network: daemon.NetworkUnix, Address: socketPath}
-	resp, err := doRequest(t, ep.HTTPClient(daemon.HTTPClientOptions{}), http.MethodGet, ep.BaseURL(), "", nil)
+	conn, err := endpoint.Dialer(daemon.DialerOptions{}).DialContext(t.Context())
 	require.NoError(err)
-	defer func() { _ = resp.Body.Close() }()
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	defer func() { _ = conn.Close() }()
+
+	_, err = conn.Write([]byte("hi"))
+	require.NoError(err)
+	reply := make([]byte, 2)
+	_, err = io.ReadFull(conn, reply)
+	require.NoError(err)
+	assert.Equal(t, "ok", string(reply))
 }
 
-func TestTCPHTTPClientBypassesEnvironmentProxy(t *testing.T) {
-	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
+func TestDialerReportsConnectionFailure(t *testing.T) {
+	endpoint := closedEndpoint(t)
 
-	ep := daemon.Endpoint{Network: daemon.NetworkTCP, Address: "10.0.0.1:7373"}
-	client := ep.HTTPClient(daemon.HTTPClientOptions{})
-	transport, ok := client.Transport.(*http.Transport)
-	require.True(t, ok)
-	assert.Nil(t, transport.Proxy)
+	_, err := endpoint.Dialer(daemon.DialerOptions{Timeout: 100 * time.Millisecond}).DialContext(t.Context())
+	require.Error(t, err)
 }
 
 func TestDefaultSocketPathCreatesPrivateTempFallback(t *testing.T) {

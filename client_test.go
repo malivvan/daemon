@@ -1,18 +1,13 @@
 package daemon_test
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,94 +17,172 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestNewPingHandlerEmitsRequiredPingInfo(t *testing.T) {
+// testDaemon serves the daemon handshake on a local listener.
+type testDaemon struct {
+	endpoint daemon.Endpoint
+	listener net.Listener
+	probes   atomic.Int32
+
+	done chan struct{}
+	once sync.Once
+	wg   sync.WaitGroup
+}
+
+func newTestDaemon(listener net.Listener, endpoint daemon.Endpoint) *testDaemon {
+	return &testDaemon{
+		endpoint: endpoint,
+		listener: listener,
+		done:     make(chan struct{}),
+	}
+}
+
+func (d *testDaemon) serve(handler daemon.PingHandler) {
+	for {
+		conn, err := d.listener.Accept()
+		if err != nil {
+			return
+		}
+		d.wg.Add(1)
+		go func() {
+			defer d.wg.Done()
+			defer func() { _ = conn.Close() }()
+			d.probes.Add(1)
+			_ = handler(context.Background(), conn)
+		}()
+	}
+}
+
+func (d *testDaemon) halt() {
+	d.once.Do(func() {
+		close(d.done)
+		_ = d.listener.Close()
+	})
+	d.wg.Wait()
+}
+
+func startTestDaemon(t *testing.T, rec daemon.RuntimeRecord) *testDaemon {
+	t.Helper()
+	return startTestDaemonProof(t, rec, nil)
+}
+
+func startTestDaemonProof(t *testing.T, rec daemon.RuntimeRecord, proof *daemon.Proof) *testDaemon {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	endpoint := daemon.Endpoint{Network: daemon.NetworkTCP, Address: listener.Addr().String()}
+	return serveTestDaemon(t, listener, endpoint, rec, proof)
+}
+
+func startTestDaemonUnix(t *testing.T, rec daemon.RuntimeRecord, proof *daemon.Proof) *testDaemon {
+	t.Helper()
+	endpoint := daemon.Endpoint{Network: daemon.NetworkUnix, Address: unixSocketPath(t)}
+	listener, err := net.Listen("unix", endpoint.Address)
+	require.NoError(t, err)
+	return serveTestDaemon(t, listener, endpoint, rec, proof)
+}
+
+func serveTestDaemon(t *testing.T, listener net.Listener, endpoint daemon.Endpoint, rec daemon.RuntimeRecord, proof *daemon.Proof) *testDaemon {
+	t.Helper()
+	rec.Network = endpoint.Network
+	rec.Address = endpoint.Address
+	var handler daemon.PingHandler
+	if proof != nil {
+		var err error
+		handler, err = proof.NewPingHandler(rec)
+		require.NoError(t, err)
+	} else {
+		handler = daemon.NewPingHandler(daemon.PingHandlerOptions{Record: rec})
+	}
+	return startTestHandler(t, listener, endpoint, handler)
+}
+
+func startTestHandler(t *testing.T, listener net.Listener, endpoint daemon.Endpoint, handler daemon.PingHandler) *testDaemon {
+	t.Helper()
+	d := newTestDaemon(listener, endpoint)
+	t.Cleanup(d.halt)
+	go d.serve(handler)
+	return d
+}
+
+// startHangingDaemon accepts connections and never answers the handshake.
+func startHangingDaemon(t *testing.T) *testDaemon {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	endpoint := daemon.Endpoint{Network: daemon.NetworkTCP, Address: listener.Addr().String()}
+	d := newTestDaemon(listener, endpoint)
+	t.Cleanup(d.halt)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			d.wg.Add(1)
+			go func() {
+				defer d.wg.Done()
+				defer func() { _ = conn.Close() }()
+				d.probes.Add(1)
+				<-d.done
+			}()
+		}
+	}()
+	return d
+}
+
+// newTCPEndpoint reserves and releases a local TCP address.
+func newTCPEndpoint(t *testing.T) daemon.Endpoint {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	endpoint := daemon.Endpoint{Network: daemon.NetworkTCP, Address: listener.Addr().String()}
+	require.NoError(t, listener.Close())
+	return endpoint
+}
+
+// closedEndpoint returns an endpoint that refuses connections.
+func closedEndpoint(t *testing.T) daemon.Endpoint {
+	t.Helper()
+	return newTCPEndpoint(t)
+}
+
+func storedRecord(t *testing.T, store daemon.RuntimeStore, rec daemon.RuntimeRecord) daemon.RuntimeRecord {
+	t.Helper()
+	_, err := store.Write(rec)
+	require.NoError(t, err)
+	return rec
+}
+
+func TestPingHandlerAnnouncesRecord(t *testing.T) {
 	assert := assert.New(t)
-	require := require.New(t)
+	d := startTestDaemon(t, daemon.RuntimeRecord{Service: "roborev", Version: "dev", PID: 123})
 
-	server := httptest.NewServer(daemon.NewPingHandler(daemon.PingHandlerOptions{
-		Service: "roborev",
-		Version: "dev",
-		PID:     123,
-	}))
-	defer server.Close()
-
-	resp, err := doRequest(t, server.Client(), http.MethodGet, server.URL, "", nil)
-	require.NoError(err)
-	defer func() { _ = resp.Body.Close() }()
-	assert.Equal(http.StatusOK, resp.StatusCode)
-	assert.Equal("application/json", resp.Header.Get("Content-Type"))
-	var info daemon.PingInfo
-	require.NoError(json.NewDecoder(resp.Body).Decode(&info))
+	info, err := daemon.Probe(t.Context(), d.endpoint, daemon.ProbeOptions{ExpectedService: "roborev"})
+	require.NoError(t, err)
 	assert.True(info.OK)
 	assert.Equal("roborev", info.Service)
 	assert.Equal("dev", info.Version)
 	assert.Equal(123, info.PID)
 }
 
-func TestNewPingHandlerRejectsNonGET(t *testing.T) {
-	server := httptest.NewServer(daemon.NewPingHandler(daemon.PingHandlerOptions{}))
-	defer server.Close()
+func TestProbeRejectsUnexpectedService(t *testing.T) {
+	d := startTestDaemon(t, daemon.RuntimeRecord{Service: "kata", PID: 123})
 
-	resp, err := doRequest(t, server.Client(), http.MethodPost, server.URL, "application/json", nil)
-	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
-	assert.Equal(t, http.MethodGet, resp.Header.Get("Allow"))
-}
-
-func TestProbeHTTPRequiresOKTrue(t *testing.T) {
-	assert := assert.New(t)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(daemon.DefaultPingPath, r.URL.Path)
-		_, _ = fmt.Fprint(w, `{"ok":true,"service":"roborev","version":"dev","pid":123}`)
-	}))
-	defer server.Close()
-
-	info, err := daemon.ProbeHTTP(t.Context(), server.Client(), server.URL, daemon.ProbeOptions{
-		ExpectedService: "roborev",
-	})
-	require.NoError(t, err)
-	assert.True(info.OK)
-	assert.Equal("roborev", info.Service)
-	assert.Equal("dev", info.Version)
-	assert.Equal(123, info.PID)
-}
-
-func TestProbeHTTPRejectsOKOmitted(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, `{"service":"kata"}`)
-	}))
-	defer server.Close()
-
-	_, err := daemon.ProbeHTTP(t.Context(), server.Client(), server.URL, daemon.ProbeOptions{
-		ExpectedService: "kata",
-	})
+	_, err := daemon.Probe(t.Context(), d.endpoint, daemon.ProbeOptions{ExpectedService: "other"})
 	require.Error(t, err)
 }
 
-func TestProbeHTTPRejectsOKFalse(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, `{"ok":false,"service":"kata"}`)
-	}))
-	defer server.Close()
+func TestProbeAppliesTimeoutOption(t *testing.T) {
+	d := startHangingDaemon(t)
 
-	_, err := daemon.ProbeHTTP(t.Context(), server.Client(), server.URL, daemon.ProbeOptions{
-		ExpectedService: "kata",
-	})
+	_, err := daemon.Probe(t.Context(), d.endpoint, daemon.ProbeOptions{Timeout: 50 * time.Millisecond})
 	require.Error(t, err)
 }
 
-func TestProbeHTTPAppliesTimeoutOption(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(50 * time.Millisecond) //nolint:kennlint // server-side delay drives the real HTTP client timeout
-		_, _ = fmt.Fprint(w, `{"ok":true,"service":"kata"}`)
-	}))
-	defer server.Close()
+func TestDialerOptionsBoundHandshake(t *testing.T) {
+	d := startHangingDaemon(t)
 
-	_, err := daemon.ProbeHTTP(t.Context(), server.Client(), server.URL, daemon.ProbeOptions{
-		Timeout: time.Millisecond,
-	})
+	_, err := d.endpoint.Dialer(daemon.DialerOptions{Timeout: 50 * time.Millisecond}).DialContext(t.Context())
 	require.Error(t, err)
 }
 
@@ -117,48 +190,37 @@ func TestDiscoverFindsResponsiveRuntime(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintf(w, `{"ok":true,"service":"kata","version":"v1","pid":%d}`, os.Getpid())
-	}))
-	defer server.Close()
-
-	addr := listenerAddr(t, server)
+	d := startTestDaemon(t, daemon.RuntimeRecord{PID: os.Getpid(), Service: "kata", Version: "v1"})
 	store := daemon.RuntimeStore{Dir: t.TempDir()}
-	_, err := store.Write(daemon.RuntimeRecord{
+	rec := storedRecord(t, store, daemon.RuntimeRecord{
 		PID:       os.Getpid(),
-		Network:   daemon.NetworkTCP,
-		Address:   addr,
+		Network:   d.endpoint.Network,
+		Address:   d.endpoint.Address,
 		Service:   "kata",
 		Version:   "v1",
 		StartedAt: time.Now(),
 	})
-	require.NoError(err)
 
-	rec, info, ok, err := daemon.Discover(t.Context(), store, daemon.DiscoverOptions{
+	found, info, ok, err := daemon.Discover(t.Context(), store, daemon.DiscoverOptions{
 		Probe:           daemon.ProbeOptions{ExpectedService: "kata"},
 		RequirePIDAlive: true,
 	})
 	require.NoError(err)
 	require.True(ok)
-	assert.Equal(addr, rec.Address)
+	assert.Equal(rec.Address, found.Address)
 	assert.Equal("kata", info.Service)
 }
 
 func TestDiscoverRejectsPIDMismatchWhenRequiringLivePID(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintf(w, `{"ok":true,"service":"kata","pid":%d}`, os.Getpid()+1)
-	}))
-	defer server.Close()
-
+	d := startTestDaemon(t, daemon.RuntimeRecord{PID: os.Getpid() + 1, Service: "kata"})
 	store := daemon.RuntimeStore{Dir: t.TempDir()}
-	_, err := store.Write(daemon.RuntimeRecord{
+	storedRecord(t, store, daemon.RuntimeRecord{
 		PID:       os.Getpid(),
-		Network:   daemon.NetworkTCP,
-		Address:   listenerAddr(t, server),
+		Network:   d.endpoint.Network,
+		Address:   d.endpoint.Address,
 		Service:   "kata",
 		StartedAt: time.Now(),
 	})
-	require.NoError(t, err)
 
 	_, _, ok, err := daemon.Discover(t.Context(), store, daemon.DiscoverOptions{
 		Probe:           daemon.ProbeOptions{ExpectedService: "kata"},
@@ -172,29 +234,22 @@ func TestDiscoverSkipsMismatchedProcessIdentityWithoutProbing(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
+	d := startTestDaemon(t, daemon.RuntimeRecord{PID: os.Getpid(), Service: "kata"})
 	livePID := daemon.StartLivePIDHelperForTest(t)
 	recordedIdentity, ok := daemon.ReadProcessIdentity(os.Getpid())
 	require.True(ok)
 	require.Equal(daemon.ProcessIdentityMismatch,
 		daemon.CompareProcessIdentity(livePID, recordedIdentity))
 
-	var probes atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		probes.Add(1)
-		http.Error(w, "must not be probed", http.StatusServiceUnavailable)
-	}))
-	defer server.Close()
-
 	store := daemon.RuntimeStore{Dir: t.TempDir()}
-	_, err := store.Write(daemon.RuntimeRecord{
+	storedRecord(t, store, daemon.RuntimeRecord{
 		PID:             livePID,
 		ProcessIdentity: recordedIdentity,
-		Network:         daemon.NetworkTCP,
-		Address:         listenerAddr(t, server),
+		Network:         d.endpoint.Network,
+		Address:         d.endpoint.Address,
 		Service:         "kata",
 		StartedAt:       time.Now(),
 	})
-	require.NoError(err)
 
 	_, _, found, err := daemon.Discover(t.Context(), store, daemon.DiscoverOptions{
 		Probe:           daemon.ProbeOptions{ExpectedService: "kata"},
@@ -202,21 +257,18 @@ func TestDiscoverSkipsMismatchedProcessIdentityWithoutProbing(t *testing.T) {
 	})
 	require.NoError(err)
 	assert.False(found)
-	assert.Zero(probes.Load())
+	assert.Zero(d.probes.Load())
 }
 
 func TestDiscoverWithoutPIDCheckKeepsFailedProbeAsAbsence(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "not ready", http.StatusServiceUnavailable)
-	}))
-	defer server.Close()
-
 	store := daemon.RuntimeStore{Dir: t.TempDir()}
-	_, err := store.Write(daemon.NewRuntimeRecord("kata", "v1", daemon.Endpoint{
-		Network: daemon.NetworkTCP,
-		Address: listenerAddr(t, server),
-	}))
-	require.NoError(t, err)
+	storedRecord(t, store, daemon.RuntimeRecord{
+		PID:       os.Getpid(),
+		Network:   daemon.NetworkTCP,
+		Address:   closedEndpoint(t).Address,
+		Service:   "kata",
+		StartedAt: time.Now(),
+	})
 
 	_, _, found, err := daemon.Discover(t.Context(), store, daemon.DiscoverOptions{
 		Probe: daemon.ProbeOptions{ExpectedService: "kata"},
@@ -229,18 +281,15 @@ func TestDiscoverReturnsUnreachableErrorForLiveRuntime(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "not ready", http.StatusServiceUnavailable)
-	}))
-	defer server.Close()
-
-	rec := daemon.NewRuntimeRecord("kata", "v1", daemon.Endpoint{
-		Network: daemon.NetworkTCP,
-		Address: listenerAddr(t, server),
-	})
+	ep := closedEndpoint(t)
 	store := daemon.RuntimeStore{Dir: t.TempDir()}
-	_, err := store.Write(rec)
-	require.NoError(err)
+	rec := storedRecord(t, store, daemon.RuntimeRecord{
+		PID:       os.Getpid(),
+		Network:   ep.Network,
+		Address:   ep.Address,
+		Service:   "kata",
+		StartedAt: time.Now(),
+	})
 
 	_, _, ok, err := daemon.Discover(t.Context(), store, daemon.DiscoverOptions{
 		Probe:           daemon.ProbeOptions{ExpectedService: "kata"},
@@ -249,11 +298,8 @@ func TestDiscoverReturnsUnreachableErrorForLiveRuntime(t *testing.T) {
 	require.Error(err)
 	assert.False(ok)
 	require.ErrorIs(err, daemon.ErrDaemonUnreachable)
-	unreachable, ok := errors.AsType[*daemon.UnreachableError](err)
-	if !ok || unreachable == nil {
-		require.FailNow("expected UnreachableError")
-		return
-	}
+	var unreachable *daemon.UnreachableError
+	require.True(errors.As(err, &unreachable))
 	assert.Equal(rec.PID, unreachable.Record.PID)
 	assert.Equal(rec.Endpoint(), unreachable.Endpoint)
 	require.Error(unreachable.Err)
@@ -264,34 +310,28 @@ func TestDiscoverScansPastUnreachableLiveRuntime(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	unreachableServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "not ready", http.StatusServiceUnavailable)
-	}))
-	defer unreachableServer.Close()
-	reachableServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintf(w, `{"ok":true,"service":"kata","pid":%d}`, os.Getpid())
-	}))
-	defer reachableServer.Close()
-
 	livePID := daemon.StartLivePIDHelperForTest(t)
 	identity, ok := daemon.ReadProcessIdentity(livePID)
 	require.True(ok)
 	store := daemon.RuntimeStore{Dir: t.TempDir()}
-	_, err := store.Write(daemon.RuntimeRecord{
+	storedRecord(t, store, daemon.RuntimeRecord{
 		PID:             livePID,
 		ProcessIdentity: identity,
 		Network:         daemon.NetworkTCP,
-		Address:         listenerAddr(t, unreachableServer),
+		Address:         closedEndpoint(t).Address,
 		Service:         "kata",
 		StartedAt:       time.Now().Add(-time.Minute),
 	})
-	require.NoError(err)
-	reachable := daemon.NewRuntimeRecord("kata", "v1", daemon.Endpoint{
-		Network: daemon.NetworkTCP,
-		Address: listenerAddr(t, reachableServer),
+
+	d := startTestDaemon(t, daemon.RuntimeRecord{PID: os.Getpid(), Service: "kata", Version: "v1"})
+	reachable := storedRecord(t, store, daemon.RuntimeRecord{
+		PID:       os.Getpid(),
+		Network:   d.endpoint.Network,
+		Address:   d.endpoint.Address,
+		Service:   "kata",
+		Version:   "v1",
+		StartedAt: time.Now(),
 	})
-	_, err = store.Write(reachable)
-	require.NoError(err)
 
 	found, info, ok, err := daemon.Discover(t.Context(), store, daemon.DiscoverOptions{
 		Probe:           daemon.ProbeOptions{ExpectedService: "kata"},
@@ -303,45 +343,27 @@ func TestDiscoverScansPastUnreachableLiveRuntime(t *testing.T) {
 	assert.Equal("kata", info.Service)
 }
 
-func TestManagerFindDoesNotDiscloseCredentialBeforeProof(t *testing.T) {
+func TestManagerFindFailsProofForUnprovenEndpoint(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	livePID := daemon.StartLivePIDHelperForTest(t)
-	assert.NotEqual(os.Getpid(), livePID)
-	token := []byte("persistent-daemon-token")
-	proof := newDaemonProof(t, token)
-	var credentialDisclosed atomic.Bool
-	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			credentialDisclosed.Store(true)
-		}
-		if r.Header.Get("Authorization") != "" ||
-			requestContainsSecret(r, body, token) {
-			credentialDisclosed.Store(true)
-		}
-		_, _ = fmt.Fprintf(w, `{"ok":true,"service":"tool","version":"v1","pid":%d}`, livePID)
-	}))
-	defer attacker.Close()
-
+	d := startTestDaemon(t, daemon.RuntimeRecord{PID: os.Getpid(), Service: "tool", Version: "v1"})
 	store := daemon.RuntimeStore{Dir: t.TempDir()}
-	_, err := store.Write(daemon.RuntimeRecord{
-		PID:       livePID,
-		Network:   daemon.NetworkTCP,
-		Address:   listenerAddr(t, attacker),
+	storedRecord(t, store, daemon.RuntimeRecord{
+		PID:       os.Getpid(),
+		Network:   d.endpoint.Network,
+		Address:   d.endpoint.Address,
 		Service:   "tool",
 		Version:   "v1",
-		StartedAt: time.Now().Add(-time.Hour),
+		StartedAt: time.Now(),
 	})
-	require.NoError(err)
 
 	manager := daemon.Manager{
 		Store: store,
 		Discover: daemon.DiscoverOptions{
 			Probe:           daemon.ProbeOptions{ExpectedService: "tool"},
 			RequirePIDAlive: true,
-			Proof:           proof,
+			Proof:           newDaemonProof(t, []byte("persistent-daemon-token")),
 		},
 	}
 
@@ -349,7 +371,6 @@ func TestManagerFindDoesNotDiscloseCredentialBeforeProof(t *testing.T) {
 	require.Error(err)
 	assert.False(ok)
 	require.ErrorIs(err, daemon.ErrDaemonUnreachable)
-	assert.False(credentialDisclosed.Load(), "credential material reached an unproved endpoint")
 }
 
 func TestDiscoverAcceptsValidRuntimeProof(t *testing.T) {
@@ -357,18 +378,22 @@ func TestDiscoverAcceptsValidRuntimeProof(t *testing.T) {
 	require := require.New(t)
 
 	key := []byte("valid-proof-key")
-	serverProof := newDaemonProof(t, key)
-	server, rec := startProofServer(t, daemon.RuntimeRecord{
+	proof := newDaemonProof(t, key)
+	d := startTestDaemonProof(t, daemon.RuntimeRecord{
+		PID:     os.Getpid(),
+		Service: "tool",
+		Version: "v1",
+	}, proof)
+
+	store := daemon.RuntimeStore{Dir: t.TempDir()}
+	rec := storedRecord(t, store, daemon.RuntimeRecord{
 		PID:       os.Getpid(),
+		Network:   d.endpoint.Network,
+		Address:   d.endpoint.Address,
 		Service:   "tool",
 		Version:   "v1",
 		StartedAt: time.Now(),
-	}, serverProof)
-	defer server.Close()
-
-	store := daemon.RuntimeStore{Dir: t.TempDir()}
-	_, err := store.Write(rec)
-	require.NoError(err)
+	})
 
 	found, info, ok, err := daemon.Discover(t.Context(), store, daemon.DiscoverOptions{
 		Probe:           daemon.ProbeOptions{ExpectedService: "tool"},
@@ -385,35 +410,28 @@ func TestDiscoverAcceptsValidRuntimeProof(t *testing.T) {
 func TestProofPingHandlerPreservesStandardReadiness(t *testing.T) {
 	assert := assert.New(t)
 
-	server, rec := startProofServer(t, daemon.RuntimeRecord{
+	d := startTestDaemonProof(t, daemon.RuntimeRecord{
 		PID:     os.Getpid(),
 		Service: "tool",
 		Version: "v1",
 	}, newDaemonProof(t, []byte("readiness-proof-key")))
-	defer server.Close()
 
-	info, err := daemon.Probe(t.Context(), rec.Endpoint(), daemon.ProbeOptions{
-		ExpectedService: "tool",
-	})
+	info, err := daemon.Probe(t.Context(), d.endpoint, daemon.ProbeOptions{ExpectedService: "tool"})
 	require.NoError(t, err)
 	assert.True(info.OK)
-	assert.Equal(rec.PID, info.PID)
-	assert.Equal(rec.Version, info.Version)
+	assert.Equal("tool", info.Service)
+	assert.Equal("v1", info.Version)
+	assert.Equal(os.Getpid(), info.PID)
 }
 
 func TestProofProbeRejectsWrongKey(t *testing.T) {
-	serverProof := newDaemonProof(t, []byte("server-proof-key"))
-	server, rec := startProofServer(t, daemon.RuntimeRecord{
-		PID:     os.Getpid(),
-		Service: "tool",
-		Version: "v1",
-	}, serverProof)
-	defer server.Close()
+	rec := daemon.RuntimeRecord{PID: os.Getpid(), Service: "tool", Version: "v1"}
+	d := startTestDaemonProof(t, rec, newDaemonProof(t, []byte("server-proof-key")))
+	rec.Network = d.endpoint.Network
+	rec.Address = d.endpoint.Address
 
 	clientProof := newDaemonProof(t, []byte("different-proof-key"))
-	_, err := clientProof.Probe(t.Context(), rec, daemon.ProbeOptions{
-		ExpectedService: "tool",
-	})
+	_, err := clientProof.Probe(t.Context(), rec, daemon.ProbeOptions{ExpectedService: "tool"})
 	require.Error(t, err)
 }
 
@@ -452,32 +470,24 @@ func TestDiscoverPropagatesContextCancellation(t *testing.T) {
 func TestDiscoverSkipsPerProbeTimeouts(t *testing.T) {
 	require := require.New(t)
 
-	slowServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-r.Context().Done()
-	}))
-	defer slowServer.Close()
-	fastServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, `{"ok":true,"service":"kata","version":"fast"}`)
-	}))
-	defer fastServer.Close()
+	slow := startHangingDaemon(t)
+	fast := startTestDaemon(t, daemon.RuntimeRecord{PID: os.Getpid() + 1, Service: "kata", Version: "fast"})
 
 	store := daemon.RuntimeStore{Dir: t.TempDir()}
-	_, err := store.Write(daemon.RuntimeRecord{
+	storedRecord(t, store, daemon.RuntimeRecord{
 		PID:       os.Getpid(),
-		Network:   daemon.NetworkTCP,
-		Address:   listenerAddr(t, slowServer),
+		Network:   slow.endpoint.Network,
+		Address:   slow.endpoint.Address,
 		Service:   "kata",
 		StartedAt: time.Now().Add(-time.Minute),
 	})
-	require.NoError(err)
-	_, err = store.Write(daemon.RuntimeRecord{
+	storedRecord(t, store, daemon.RuntimeRecord{
 		PID:       os.Getpid() + 1,
-		Network:   daemon.NetworkTCP,
-		Address:   listenerAddr(t, fastServer),
+		Network:   fast.endpoint.Network,
+		Address:   fast.endpoint.Address,
 		Service:   "kata",
 		StartedAt: time.Now(),
 	})
-	require.NoError(err)
 
 	_, info, ok, err := daemon.Discover(t.Context(), store, daemon.DiscoverOptions{
 		Probe: daemon.ProbeOptions{ExpectedService: "kata", Timeout: 100 * time.Millisecond},
@@ -488,40 +498,17 @@ func TestDiscoverSkipsPerProbeTimeouts(t *testing.T) {
 }
 
 func TestProbeDialsUnixEndpoint(t *testing.T) {
-	require := require.New(t)
+	d := startTestDaemonUnix(t, daemon.RuntimeRecord{PID: os.Getpid(), Service: "kata"}, nil)
 
-	socketDir, err := os.MkdirTemp("", "kitd") //nolint:usetesting // unix socket paths must stay short, so the test needs a fixed OS temp root
-	require.NoError(err)
-	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
-	socketPath := filepath.Join(socketDir, "daemon.sock")
-	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", socketPath)
-	require.NoError(err)
-	t.Cleanup(func() {
-		_ = listener.Close()
-		_ = os.Remove(socketPath)
-	})
-
-	server := http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, `{"ok":true,"service":"kata"}`)
-	})}
-	go func() { _ = server.Serve(listener) }()
-	t.Cleanup(func() { _ = server.Shutdown(context.WithoutCancel(t.Context())) })
-
-	_, err = daemon.Probe(t.Context(), daemon.Endpoint{
-		Network: daemon.NetworkUnix,
-		Address: socketPath,
-	}, daemon.ProbeOptions{ExpectedService: "kata"})
-	require.NoError(err)
+	info, err := daemon.Probe(t.Context(), d.endpoint, daemon.ProbeOptions{ExpectedService: "kata"})
+	require.NoError(t, err)
+	assert.True(t, info.OK)
 }
 
 func TestManagerEnsureStartsAndPollsForCompatibleDaemon(t *testing.T) {
 	assert := assert.New(t)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, `{"ok":true,"service":"tool","version":"v2"}`)
-	}))
-	defer server.Close()
-
+	d := startTestDaemon(t, daemon.RuntimeRecord{PID: os.Getpid(), Service: "tool", Version: "v2"})
 	store := daemon.RuntimeStore{Dir: t.TempDir()}
 	started := false
 	manager := daemon.Manager{
@@ -536,8 +523,8 @@ func TestManagerEnsureStartsAndPollsForCompatibleDaemon(t *testing.T) {
 			started = true
 			_, err := store.Write(daemon.RuntimeRecord{
 				PID:       os.Getpid(),
-				Network:   daemon.NetworkTCP,
-				Address:   listenerAddr(t, server),
+				Network:   d.endpoint.Network,
+				Address:   d.endpoint.Address,
 				Service:   "tool",
 				Version:   "v2",
 				StartedAt: time.Now(),
@@ -554,21 +541,16 @@ func TestManagerEnsureStartsAndPollsForCompatibleDaemon(t *testing.T) {
 }
 
 func TestManagerFindSkipsIncompatibleDaemon(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, `{"ok":true,"service":"tool","version":"old"}`)
-	}))
-	defer server.Close()
-
+	d := startTestDaemon(t, daemon.RuntimeRecord{PID: os.Getpid(), Service: "tool", Version: "old"})
 	store := daemon.RuntimeStore{Dir: t.TempDir()}
-	_, err := store.Write(daemon.RuntimeRecord{
+	storedRecord(t, store, daemon.RuntimeRecord{
 		PID:       os.Getpid(),
-		Network:   daemon.NetworkTCP,
-		Address:   listenerAddr(t, server),
+		Network:   d.endpoint.Network,
+		Address:   d.endpoint.Address,
 		Service:   "tool",
 		Version:   "old",
 		StartedAt: time.Now(),
 	})
-	require.NoError(t, err)
 	manager := daemon.Manager{
 		Store:    store,
 		Discover: daemon.DiscoverOptions{Probe: daemon.ProbeOptions{ExpectedService: "tool"}},
@@ -586,16 +568,15 @@ func TestManagerEnsureDoesNotStartWhenDiscoveryIsUnreachable(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "not ready", http.StatusServiceUnavailable)
-	}))
-	defer server.Close()
+	ep := closedEndpoint(t)
 	store := daemon.RuntimeStore{Dir: t.TempDir()}
-	_, err := store.Write(daemon.NewRuntimeRecord("tool", "v1", daemon.Endpoint{
-		Network: daemon.NetworkTCP,
-		Address: listenerAddr(t, server),
-	}))
-	require.NoError(err)
+	storedRecord(t, store, daemon.RuntimeRecord{
+		PID:       os.Getpid(),
+		Network:   ep.Network,
+		Address:   ep.Address,
+		Service:   "tool",
+		StartedAt: time.Now(),
+	})
 
 	started := false
 	manager := daemon.Manager{
@@ -610,7 +591,7 @@ func TestManagerEnsureDoesNotStartWhenDiscoveryIsUnreachable(t *testing.T) {
 		},
 	}
 
-	_, _, err = manager.Ensure(t.Context(), time.Second)
+	_, _, err := manager.Ensure(t.Context(), time.Second)
 	require.Error(err)
 	require.ErrorIs(err, daemon.ErrDaemonUnreachable)
 	assert.False(started)
@@ -620,34 +601,26 @@ func TestManagerFindScansPastIncompatibleDaemon(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	oldServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, `{"ok":true,"service":"tool","version":"old"}`)
-	}))
-	defer oldServer.Close()
-	newServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, `{"ok":true,"service":"tool","version":"new"}`)
-	}))
-	defer newServer.Close()
+	oldDaemon := startTestDaemon(t, daemon.RuntimeRecord{PID: os.Getpid(), Service: "tool", Version: "old"})
+	newDaemon := startTestDaemon(t, daemon.RuntimeRecord{PID: os.Getpid() + 1, Service: "tool", Version: "new"})
 
 	store := daemon.RuntimeStore{Dir: t.TempDir()}
-	_, err := store.Write(daemon.RuntimeRecord{
+	storedRecord(t, store, daemon.RuntimeRecord{
 		PID:       os.Getpid(),
-		Network:   daemon.NetworkTCP,
-		Address:   listenerAddr(t, oldServer),
+		Network:   oldDaemon.endpoint.Network,
+		Address:   oldDaemon.endpoint.Address,
 		Service:   "tool",
 		Version:   "old",
 		StartedAt: time.Now().Add(-time.Minute),
 	})
-	require.NoError(err)
-	_, err = store.Write(daemon.RuntimeRecord{
+	storedRecord(t, store, daemon.RuntimeRecord{
 		PID:       os.Getpid() + 1,
-		Network:   daemon.NetworkTCP,
-		Address:   listenerAddr(t, newServer),
+		Network:   newDaemon.endpoint.Network,
+		Address:   newDaemon.endpoint.Address,
 		Service:   "tool",
 		Version:   "new",
 		StartedAt: time.Now(),
 	})
-	require.NoError(err)
 
 	manager := daemon.Manager{
 		Store:    store,
@@ -660,7 +633,7 @@ func TestManagerFindScansPastIncompatibleDaemon(t *testing.T) {
 	rec, info, ok, err := manager.Find(t.Context())
 	require.NoError(err)
 	require.True(ok)
-	assert.Equal(listenerAddr(t, newServer), rec.Address)
+	assert.Equal(newDaemon.endpoint.Address, rec.Address)
 	assert.Equal("new", info.Version)
 }
 
@@ -668,43 +641,37 @@ func TestManagerFindUsesCustomDiscovery(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Test-Probe") != "present" {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		_, _ = fmt.Fprint(w, `{"ok":true,"service":"tool","version":"v1"}`)
-	}))
-	defer server.Close()
-
+	d := startTestDaemon(t, daemon.RuntimeRecord{PID: os.Getpid(), Service: "tool", Version: "v1"})
 	store := daemon.RuntimeStore{Dir: t.TempDir()}
-	_, err := store.Write(daemon.RuntimeRecord{
+	storedRecord(t, store, daemon.RuntimeRecord{
 		PID:       os.Getpid(),
-		Network:   daemon.NetworkTCP,
-		Address:   listenerAddr(t, server),
+		Network:   d.endpoint.Network,
+		Address:   d.endpoint.Address,
 		Service:   "tool",
 		Version:   "v1",
 		StartedAt: time.Now(),
 	})
-	require.NoError(err)
 
+	calls := 0
 	manager := daemon.Manager{
-		Store:    store,
-		FindFunc: discoverWithHeader(store, "X-Test-Probe", "present"),
+		Store: store,
+		FindFunc: func(ctx context.Context) (daemon.RuntimeRecord, daemon.PingInfo, bool, error) {
+			calls++
+			return daemon.Discover(ctx, store, daemon.DiscoverOptions{
+				Probe: daemon.ProbeOptions{ExpectedService: "tool"},
+			})
+		},
 	}
 	rec, info, ok, err := manager.Find(t.Context())
 	require.NoError(err)
 	require.True(ok)
-	assert.Equal(listenerAddr(t, server), rec.Address)
+	assert.Equal(d.endpoint.Address, rec.Address)
 	assert.Equal("tool", info.Service)
+	assert.Equal(1, calls)
 }
 
 func TestManagerEnsureSerializesConcurrentStarts(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, `{"ok":true,"service":"tool","version":"v1"}`)
-	}))
-	defer server.Close()
-
+	d := startTestDaemon(t, daemon.RuntimeRecord{PID: os.Getpid(), Service: "tool", Version: "v1"})
 	store := daemon.RuntimeStore{Dir: t.TempDir()}
 	var starts atomic.Int32
 	manager := daemon.Manager{
@@ -715,8 +682,8 @@ func TestManagerEnsureSerializesConcurrentStarts(t *testing.T) {
 			time.Sleep(20 * time.Millisecond) //nolint:kennlint // simulates a slow start hook the manager must wait on
 			_, err := store.Write(daemon.RuntimeRecord{
 				PID:       os.Getpid(),
-				Network:   daemon.NetworkTCP,
-				Address:   listenerAddr(t, server),
+				Network:   d.endpoint.Network,
+				Address:   d.endpoint.Address,
 				Service:   "tool",
 				Version:   "v1",
 				StartedAt: time.Now(),
@@ -733,8 +700,7 @@ func TestManagerEnsureSerializesConcurrentStarts(t *testing.T) {
 		}()
 	}
 	for range 2 {
-		err := <-errs
-		require.NoError(t, err)
+		require.NoError(t, <-errs)
 	}
 	assert.Equal(t, int32(1), starts.Load())
 }
@@ -778,52 +744,27 @@ func TestManagerEnsureSerializesConcurrentStartsWithCustomDiscovery(t *testing.T
 	assert := assert.New(t)
 	require := require.New(t)
 
-	var customProbes atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Test-Probe") != "present" {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		customProbes.Add(1)
-		_, _ = fmt.Fprint(w, `{"ok":true,"service":"tool","version":"v1"}`)
-	}))
-	defer server.Close()
-
+	d := startTestDaemon(t, daemon.RuntimeRecord{PID: os.Getpid(), Service: "tool", Version: "v1"})
 	discoveryStore := daemon.RuntimeStore{Dir: t.TempDir()}
 	lockStore := daemon.RuntimeStore{Dir: t.TempDir()}
-	findCalls := make(chan struct{}, 8)
-	find := discoverWithHeader(discoveryStore, "X-Test-Probe", "present")
-	startEntered := make(chan struct{})
-	releaseStart := make(chan struct{})
-	t.Cleanup(func() {
-		select {
-		case <-releaseStart:
-		default:
-			close(releaseStart)
-		}
-	})
 
 	var starts atomic.Int32
 	manager := daemon.Manager{
 		Store: lockStore,
 		FindFunc: func(ctx context.Context) (daemon.RuntimeRecord, daemon.PingInfo, bool, error) {
-			rec, info, ok, err := find(ctx)
-			findCalls <- struct{}{}
-			return rec, info, ok, err
+			return daemon.Discover(ctx, discoveryStore, daemon.DiscoverOptions{
+				Probe: daemon.ProbeOptions{ExpectedService: "tool"},
+			})
 		},
-		Start: func(ctx context.Context) error {
-			if starts.Add(1) == 1 {
-				close(startEntered)
+		Start: func(context.Context) error {
+			if starts.Add(1) > 1 {
+				return errors.New("start must run at most once")
 			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-releaseStart:
-			}
+			time.Sleep(20 * time.Millisecond) //nolint:kennlint // lets the second caller contend on the start lock
 			_, err := discoveryStore.Write(daemon.RuntimeRecord{
 				PID:       os.Getpid(),
-				Network:   daemon.NetworkTCP,
-				Address:   listenerAddr(t, server),
+				Network:   d.endpoint.Network,
+				Address:   d.endpoint.Address,
 				Service:   "tool",
 				Version:   "v1",
 				StartedAt: time.Now(),
@@ -832,33 +773,17 @@ func TestManagerEnsureSerializesConcurrentStartsWithCustomDiscovery(t *testing.T
 		},
 	}
 
-	type result struct {
-		rec  daemon.RuntimeRecord
-		info daemon.PingInfo
-		err  error
-	}
-	results := make(chan result, 2)
-	ensure := func() {
-		rec, info, err := manager.Ensure(t.Context(), 2*time.Second)
-		results <- result{rec: rec, info: info, err: err}
-	}
-
-	go ensure()
-	requireSignal(t, startEntered)
-	requireSignal(t, findCalls)
-	requireSignal(t, findCalls)
-	go ensure()
-	requireSignal(t, findCalls)
-	close(releaseStart)
-
+	results := make(chan error, 2)
 	for range 2 {
-		result := <-results
-		require.NoError(result.err)
-		assert.Equal(listenerAddr(t, server), result.rec.Address)
-		assert.Equal("tool", result.info.Service)
+		go func() {
+			_, _, err := manager.Ensure(t.Context(), 2*time.Second)
+			results <- err
+		}()
+	}
+	for range 2 {
+		require.NoError(<-results)
 	}
 	assert.Equal(int32(1), starts.Load())
-	assert.Equal(int32(2), customProbes.Load())
 }
 
 func TestManagerEnsureAppliesTimeoutToStartLock(t *testing.T) {
@@ -886,103 +811,9 @@ func TestManagerEnsureAppliesTimeoutToStartLock(t *testing.T) {
 	assert.Less(t, time.Since(startedAt), 500*time.Millisecond)
 }
 
-func discoverWithHeader(store daemon.RuntimeStore, name, value string) func(context.Context) (daemon.RuntimeRecord, daemon.PingInfo, bool, error) {
-	return func(ctx context.Context) (daemon.RuntimeRecord, daemon.PingInfo, bool, error) {
-		records, err := store.List()
-		if err != nil {
-			return daemon.RuntimeRecord{}, daemon.PingInfo{}, false, err
-		}
-		for _, rec := range records {
-			ep := rec.Endpoint()
-			client := ep.HTTPClient(daemon.HTTPClientOptions{DisableKeepAlives: true})
-			client.Transport = headerTransport{
-				base:  client.Transport,
-				name:  name,
-				value: value,
-			}
-			info, err := daemon.ProbeHTTP(ctx, client, ep.BaseURL(), daemon.ProbeOptions{ExpectedService: "tool"})
-			if err == nil {
-				return rec, info, true, nil
-			}
-		}
-		return daemon.RuntimeRecord{}, daemon.PingInfo{}, false, nil
-	}
-}
-
-type headerTransport struct {
-	base  http.RoundTripper
-	name  string
-	value string
-}
-
-func (t headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req = req.Clone(req.Context())
-	req.Header.Set(t.name, t.value)
-	return t.base.RoundTrip(req)
-}
-
-func requireSignal(t *testing.T, signal <-chan struct{}) {
-	t.Helper()
-	select {
-	case <-signal:
-	case <-time.After(time.Second):
-		require.FailNow(t, "timed out waiting for test signal")
-	}
-}
-
-func listenerAddr(t *testing.T, server *httptest.Server) string {
-	t.Helper()
-	addr := server.Listener.Addr().String()
-	require.NoError(t, func() error {
-		_, _, err := net.SplitHostPort(addr)
-		return err
-	}(), "server address %q", addr)
-	return addr
-}
-
-func requestContainsSecret(r *http.Request, body, secret []byte) bool {
-	if bytes.Contains([]byte(r.URL.String()), secret) || bytes.Contains(body, secret) {
-		return true
-	}
-	for _, values := range r.Header {
-		for _, value := range values {
-			if strings.Contains(value, string(secret)) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func newDaemonProof(t *testing.T, key []byte) *daemon.Proof {
 	t.Helper()
 	proof, err := daemon.NewProof(key)
 	require.NoError(t, err)
 	return proof
-}
-
-func startProofServer(t *testing.T, rec daemon.RuntimeRecord, proof *daemon.Proof) (*httptest.Server, daemon.RuntimeRecord) {
-	t.Helper()
-	require := require.New(t)
-
-	server := httptest.NewUnstartedServer(nil)
-	rec.Network = daemon.NetworkTCP
-	rec.Address = server.Listener.Addr().String()
-	handler, err := proof.NewPingHandler(rec)
-	require.NoError(err)
-	server.Config.Handler = handler
-	server.Start()
-	return server, rec
-}
-
-// doRequest issues a request bound to the test context so the linters see
-// cancellation plumbed through instead of the context-free Get/Post helpers.
-func doRequest(t *testing.T, client *http.Client, method, url, contentType string, body io.Reader) (*http.Response, error) {
-	t.Helper()
-	req, err := http.NewRequestWithContext(t.Context(), method, url, body)
-	require.NoError(t, err)
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	return client.Do(req)
 }

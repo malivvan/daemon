@@ -4,12 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"math"
-	"net/http"
-	"net/http/httptest"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -127,133 +127,283 @@ func TestRuntimeStoreWriteReturnsPathWhenRecordWasPublishedButNotDurable(t *test
 	require.NoError(statErr)
 }
 
-func TestProofMACBindsRuntimeIdentity(t *testing.T) {
-	key := []byte("identity-proof-key")
-	nonce := bytes.Repeat([]byte{0x42}, proofNonceSize)
-	rec := RuntimeRecord{
+func testProof(t *testing.T, key string) *Proof {
+	t.Helper()
+	proof, err := NewProof([]byte(key))
+	require.NoError(t, err)
+	return proof
+}
+
+func testPingRecord() RuntimeRecord {
+	return RuntimeRecord{
 		PID:     123,
 		Network: NetworkTCP,
 		Address: "127.0.0.1:4321",
 		Service: "tool",
 		Version: "v1",
 	}
-	want, err := proofMAC(key, nonce, rec)
+}
+
+func TestPingRequestEncodeDecode(t *testing.T) {
+	challenge := bytes.Repeat([]byte{0x42}, proofNonceSize)
+	encoded, err := (PingRequest{Challenge: challenge}).Encode()
+	require.NoError(t, err)
+
+	var decoded PingRequest
+	require.NoError(t, decoded.Decode(encoded))
+	assert.Equal(t, challenge, decoded.Challenge)
+
+	empty, err := (PingRequest{}).Encode()
+	require.NoError(t, err)
+	var emptyDecoded PingRequest
+	require.NoError(t, emptyDecoded.Decode(empty))
+	assert.Empty(t, emptyDecoded.Challenge)
+}
+
+func TestPingResponseEncodeDecode(t *testing.T) {
+	want := PingResponse{
+		Info:  PingInfo{OK: true, Service: "tool", Version: "v1", PID: 123},
+		Proof: bytes.Repeat([]byte{0x24}, 32),
+		Error: "",
+	}
+	encoded, err := want.Encode()
+	require.NoError(t, err)
+
+	var decoded PingResponse
+	require.NoError(t, decoded.Decode(encoded))
+	assert.Equal(t, want.Info, decoded.Info)
+	assert.Equal(t, want.Proof, decoded.Proof)
+	assert.Empty(t, decoded.Error)
+}
+
+func TestPingMessageDecodeRejectsMalformedInput(t *testing.T) {
+	valid, err := (PingResponse{Info: PingInfo{OK: true, Service: "tool", PID: 1}}).Encode()
 	require.NoError(t, err)
 
 	tests := []struct {
 		name string
-		rec  RuntimeRecord
+		data []byte
 	}{
-		{name: "service", rec: RuntimeRecord{PID: 123, Network: NetworkTCP, Address: "127.0.0.1:4321", Service: "other", Version: "v1"}},
-		{name: "version", rec: RuntimeRecord{PID: 123, Network: NetworkTCP, Address: "127.0.0.1:4321", Service: "tool", Version: "v2"}},
-		{name: "PID", rec: RuntimeRecord{PID: 456, Network: NetworkTCP, Address: "127.0.0.1:4321", Service: "tool", Version: "v1"}},
-		{name: "network", rec: RuntimeRecord{PID: 123, Network: NetworkUnix, Address: "127.0.0.1:4321", Service: "tool", Version: "v1"}},
-		{name: "address", rec: RuntimeRecord{PID: 123, Network: NetworkTCP, Address: "127.0.0.1:9876", Service: "tool", Version: "v1"}},
+		{name: "empty", data: nil},
+		{name: "truncated", data: valid[:len(valid)-1]},
+		{name: "trailing", data: append(bytes.Clone(valid), 0)},
+		{name: "wrong type", data: append([]byte{99}, valid[1:]...)},
+		{name: "wrong version", data: append([]byte{valid[0], 2}, valid[2:]...)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert := assert.New(t)
-			require := require.New(t)
-
-			got, err := proofMAC(key, nonce, tt.rec)
-			require.NoError(err)
-			assert.NotEqual(want, got)
+			var decoded PingResponse
+			require.Error(t, decoded.Decode(tt.data))
 		})
 	}
 }
 
-func TestProofPingHandlerRejectsMalformedChallenge(t *testing.T) {
-	require := require.New(t)
+func TestReadMessageRejectsOversizedFrame(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
-	proof, err := NewProof([]byte("handler-proof-key"))
-	require.NoError(err)
-	handler, err := proof.NewPingHandler(RuntimeRecord{
-		PID:     123,
-		Network: NetworkTCP,
-		Address: "127.0.0.1:4321",
-		Service: "tool",
-	})
-	require.NoError(err)
+	go func() {
+		var size [4]byte
+		binary.BigEndian.PutUint32(size[:], maxMessageSize+1)
+		_, _ = server.Write(size[:])
+	}()
 
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, DefaultPingPath, nil)
-	req.Header.Set(proofChallengeHeader, "not-a-valid-challenge")
-	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, req)
-
-	assert.Equal(t, http.StatusBadRequest, recorder.Code)
-	assert.Empty(t, recorder.Header().Get(proofResponseHeader))
-}
-
-func TestProofProbeRejectsMalformedResponse(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set(proofResponseHeader, "not-a-valid-proof")
-		_, _ = fmt.Fprint(w, `{"ok":true,"service":"tool","version":"v1","pid":123}`)
-	}))
-	defer server.Close()
-
-	rec := RuntimeRecord{
-		PID:     123,
-		Network: NetworkTCP,
-		Address: server.Listener.Addr().String(),
-		Service: "tool",
-		Version: "v1",
-	}
-	proof, err := NewProof([]byte("client-proof-key"))
-	require.NoError(t, err)
-	_, err = proof.probeHTTP(t.Context(), server.Client(), server.URL, rec, ProbeOptions{
-		ExpectedService: "tool",
-	})
+	_, err := readMessage(client)
 	require.Error(t, err)
 }
 
-func TestProofProbeRejectsReplayedResponse(t *testing.T) {
-	require := require.New(t)
+func TestWireStringsAreLengthBounded(t *testing.T) {
+	_, err := (PingResponse{Info: PingInfo{Service: string(bytes.Repeat([]byte{'a'}, 0x10000))}}).Encode()
+	require.Error(t, err)
+}
 
+func TestProofMACBindsRuntimeIdentity(t *testing.T) {
+	key := []byte("identity-proof-key")
+	nonce := bytes.Repeat([]byte{0x42}, proofNonceSize)
+	endpoint := Endpoint{Network: NetworkTCP, Address: "127.0.0.1:4321"}
+	info := PingInfo{OK: true, Service: "tool", Version: "v1", PID: 123}
+	want, err := proofMAC(key, nonce, endpoint, info)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name     string
+		endpoint Endpoint
+		info     PingInfo
+	}{
+		{name: "service", endpoint: endpoint, info: PingInfo{OK: true, Service: "other", Version: "v1", PID: 123}},
+		{name: "version", endpoint: endpoint, info: PingInfo{OK: true, Service: "tool", Version: "v2", PID: 123}},
+		{name: "PID", endpoint: endpoint, info: PingInfo{OK: true, Service: "tool", Version: "v1", PID: 456}},
+		{name: "network", endpoint: Endpoint{Network: NetworkUnix, Address: "127.0.0.1:4321"}, info: info},
+		{name: "address", endpoint: Endpoint{Network: NetworkTCP, Address: "127.0.0.1:9876"}, info: info},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := proofMAC(key, nonce, tt.endpoint, tt.info)
+			require.NoError(t, err)
+			assert.NotEqual(t, want, got)
+		})
+	}
+}
+
+func TestPingHandlerRejectsMalformedChallenge(t *testing.T) {
+	endpoint := testPingRecord()
+	handler := NewPingHandler(PingHandlerOptions{Record: endpoint, Proof: testProof(t, "handler-proof-key")})
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+
+	done := make(chan error, 1)
+	go func() {
+		err := handler(t.Context(), server)
+		_ = server.Close()
+		done <- err
+	}()
+
+	require.NoError(t, writeMessage(client, PingRequest{Challenge: []byte{1}}))
+	payload, err := readMessage(client)
+	require.NoError(t, err)
+	var resp PingResponse
+	require.NoError(t, resp.Decode(payload))
+	assert.False(t, resp.Info.OK)
+	assert.Contains(t, resp.Error, "invalid daemon proof challenge")
+	require.NoError(t, <-done)
+}
+
+func TestPingHandlerWithoutProofRejectsChallenge(t *testing.T) {
+	handler := NewPingHandler(PingHandlerOptions{Record: testPingRecord()})
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+
+	done := make(chan error, 1)
+	go func() {
+		err := handler(t.Context(), server)
+		_ = server.Close()
+		done <- err
+	}()
+
+	require.NoError(t, writeMessage(client, PingRequest{Challenge: bytes.Repeat([]byte{0x11}, proofNonceSize)}))
+	payload, err := readMessage(client)
+	require.NoError(t, err)
+	var resp PingResponse
+	require.NoError(t, resp.Decode(payload))
+	assert.False(t, resp.Info.OK)
+	assert.Contains(t, resp.Error, "proof is not configured")
+	require.NoError(t, <-done)
+}
+
+func TestPingHandlerAnswersProofChallenge(t *testing.T) {
+	rec := testPingRecord()
+	proof := testProof(t, "handler-proof-key")
+	handler := NewPingHandler(PingHandlerOptions{Record: rec, Proof: proof})
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+
+	done := make(chan error, 1)
+	go func() {
+		err := handler(t.Context(), server)
+		_ = server.Close()
+		done <- err
+	}()
+
+	challenge := bytes.Repeat([]byte{0x33}, proofNonceSize)
+	require.NoError(t, writeMessage(client, PingRequest{Challenge: challenge}))
+	payload, err := readMessage(client)
+	require.NoError(t, err)
+	var resp PingResponse
+	require.NoError(t, resp.Decode(payload))
+	assert.True(t, resp.Info.OK)
+
+	want, err := proofMAC(proof.key, challenge, rec.Endpoint(), resp.Info)
+	require.NoError(t, err)
+	assert.Equal(t, want, resp.Proof)
+	require.NoError(t, <-done)
+}
+
+func TestPingConnRejectsMalformedProof(t *testing.T) {
+	endpoint := Endpoint{Network: NetworkTCP, Address: "127.0.0.1:4321"}
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+
+	go func() {
+		_, _ = readMessage(server)
+		_ = writeMessage(server, PingResponse{
+			Info:  PingInfo{OK: true, Service: "tool", Version: "v1", PID: 123},
+			Proof: []byte("short"),
+		})
+		_ = server.Close()
+	}()
+
+	_, err := pingConn(t.Context(), client, endpoint, testProof(t, "client-proof-key"))
+	require.Error(t, err)
+}
+
+func TestPingConnRejectsNonOKResponse(t *testing.T) {
+	endpoint := Endpoint{Network: NetworkTCP, Address: "127.0.0.1:4321"}
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+
+	go func() {
+		_, _ = readMessage(server)
+		_ = writeMessage(server, PingResponse{Info: PingInfo{OK: false}})
+		_ = server.Close()
+	}()
+
+	_, err := pingConn(t.Context(), client, endpoint, nil)
+	require.Error(t, err)
+}
+
+func TestPingConnRejectsReplayedProof(t *testing.T) {
+	endpoint := Endpoint{Network: NetworkTCP, Address: "127.0.0.1:4321"}
+	info := PingInfo{OK: true, Service: "tool", Version: "v1", PID: 123}
 	key := []byte("replay-proof-key")
-	serverProof, err := NewProof(key)
-	require.NoError(err)
-	server := httptest.NewUnstartedServer(nil)
-	rec := RuntimeRecord{
-		PID:     123,
-		Network: NetworkTCP,
-		Address: server.Listener.Addr().String(),
-		Service: "tool",
-		Version: "v1",
-	}
-	handler, err := serverProof.NewPingHandler(rec)
-	require.NoError(err)
-	server.Config.Handler = handler
-	server.Start()
-	defer server.Close()
+	var replayed []byte
 
-	client := *server.Client()
-	client.Transport = &replayProofTransport{base: client.Transport}
-	clientProof, err := NewProof(key)
-	require.NoError(err)
-	_, err = clientProof.probeHTTP(t.Context(), &client, server.URL, rec, ProbeOptions{
-		ExpectedService: "tool",
-	})
-	require.NoError(err)
-	_, err = clientProof.probeHTTP(t.Context(), &client, server.URL, rec, ProbeOptions{
-		ExpectedService: "tool",
-	})
-	require.Error(err)
+	run := func() error {
+		client, server := net.Pipe()
+		defer func() { _ = client.Close() }()
+		go func() {
+			payload, err := readMessage(server)
+			if err == nil {
+				var req PingRequest
+				if err == nil {
+					err = req.Decode(payload)
+				}
+				if err == nil {
+					if replayed == nil {
+						replayed, err = proofMAC(key, req.Challenge, endpoint, info)
+					}
+					if err == nil {
+						_ = writeMessage(server, PingResponse{Info: info, Proof: replayed})
+					}
+				}
+			}
+			_ = server.Close()
+		}()
+		_, err := pingConn(t.Context(), client, endpoint, testProof(t, string(key)))
+		return err
+	}
+
+	require.NoError(t, run())
+	require.Error(t, run())
 }
 
-type replayProofTransport struct {
-	base         http.RoundTripper
-	firstHeaders http.Header
-}
+func TestPingConnVerifiesResponseIdentity(t *testing.T) {
+	endpoint := Endpoint{Network: NetworkTCP, Address: "127.0.0.1:4321"}
+	key := []byte("identity-bind-key")
+	serverInfo := PingInfo{OK: true, Service: "tool", Version: "v1", PID: 999}
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
 
-func (t *replayProofTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := t.base.RoundTrip(req)
-	if err != nil {
-		return nil, err
-	}
-	if t.firstHeaders == nil {
-		t.firstHeaders = resp.Header.Clone()
-	} else {
-		resp.Header = t.firstHeaders.Clone()
-	}
-	return resp, nil
+	go func() {
+		payload, _ := readMessage(server)
+		var req PingRequest
+		_ = req.Decode(payload)
+		mac, _ := proofMAC(key, req.Challenge, endpoint, serverInfo)
+		_ = writeMessage(server, PingResponse{Info: serverInfo, Proof: mac})
+		_ = server.Close()
+	}()
+
+	info, err := pingConn(t.Context(), client, endpoint, testProof(t, string(key)))
+	require.NoError(t, err)
+	assert.Equal(t, 999, info.PID)
 }

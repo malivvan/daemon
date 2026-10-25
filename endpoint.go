@@ -2,9 +2,9 @@
 // daemons used by CLI tools.
 //
 // It covers the lifecycle pieces that should be shared across tools:
-// endpoint parsing and HTTP clients for TCP or Unix sockets, atomic
+// endpoint parsing and dialers for TCP or Unix sockets, atomic
 // daemon.<pid>.json runtime files with opaque process-creation identity,
-// distinct start and lifetime-owner locks, PID plus ping-based discovery, and
+// distinct start and lifetime-owner locks, PID plus handshake discovery, and
 // a small Manager that can auto-start an application daemon through a
 // caller-provided StartFunc. Process creation identity is optional when the
 // platform cannot inspect it and an unknown identity never proves ownership.
@@ -37,8 +37,8 @@
 // Proof.Probe directly.
 //
 // Stop verifies a recorded endpoint, runs the caller's shutdown request, and
-// waits for exit with a timeout. StopOptions.Proof is required for TCP records
-// in every process scope; StopOptions.Exited alone decides exit when set.
+// waits for exit with a timeout. StopOptions.Proof is used only when supplied;
+// StopOptions.Exited alone decides exit when set.
 //
 // Application-specific server setup, database wiring, auth policy, CLI
 // commands, and shutdown behavior remain in the owning tool.
@@ -49,7 +49,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -210,7 +209,8 @@ func (e Endpoint) ConfigAddress() string {
 	return e.Address
 }
 
-// BaseURL returns the HTTP base URL for daemon API requests.
+// BaseURL returns the HTTP base URL for callers that layer HTTP on the daemon
+// protocol.
 func (e Endpoint) BaseURL() string {
 	if e.IsUnix() {
 		return "http://localhost"
@@ -252,38 +252,46 @@ func (e Endpoint) ListenContext(ctx context.Context) (net.Listener, error) {
 	return (&net.ListenConfig{}).Listen(ctx, e.Network, e.Address)
 }
 
-// HTTPClientOptions configures HTTPClient.
-type HTTPClientOptions struct {
-	Timeout               time.Duration
-	ResponseHeaderTimeout time.Duration
-	DisableKeepAlives     bool
+// DialerOptions configures Endpoint.Dialer.
+type DialerOptions struct {
+	// Timeout bounds connecting and the daemon handshake. Zero relies on the
+	// context's deadline.
+	Timeout time.Duration
+	// KeepAlive is the TCP keep-alive period passed to net.Dialer. Zero uses
+	// the platform default.
+	KeepAlive time.Duration
+	// Proof, when set, authenticates the daemon handshake. Nil leaves the
+	// handshake unproven.
+	Proof *Proof
 }
 
-// HTTPClient returns a client configured to dial the endpoint.
-func (e Endpoint) HTTPClient(opts HTTPClientOptions) *http.Client {
-	client := &http.Client{Timeout: opts.Timeout}
-	if e.IsUnix() {
-		client.Transport = &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, NetworkUnix, e.Address)
-			},
-			DisableKeepAlives:     opts.DisableKeepAlives,
-			Proxy:                 nil,
-			ResponseHeaderTimeout: opts.ResponseHeaderTimeout,
-		}
-		return client
+// Dialer dials one endpoint and performs the daemon handshake, so the returned
+// connection is ready for the application's protocol.
+type Dialer struct {
+	endpoint Endpoint
+	options  DialerOptions
+}
+
+// Dialer returns a dialer for e. The returned connection has already answered
+// the daemon ping handshake, proven possession of DialerOptions.Proof when one
+// is set, and carries no deadline.
+func (e Endpoint) Dialer(opts DialerOptions) *Dialer {
+	return &Dialer{endpoint: e, options: opts}
+}
+
+// Endpoint returns the endpoint this dialer connects to.
+func (d *Dialer) Endpoint() Endpoint {
+	return d.endpoint
+}
+
+// DialContext connects to the endpoint and performs the daemon handshake. The
+// caller must close the returned connection.
+func (d *Dialer) DialContext(ctx context.Context) (net.Conn, error) {
+	if d == nil {
+		return nil, errors.New("daemon dialer is nil")
 	}
-	base, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		client.Transport = &http.Transport{Proxy: nil}
-		return client
-	}
-	transport := base.Clone()
-	transport.Proxy = nil
-	transport.ResponseHeaderTimeout = opts.ResponseHeaderTimeout
-	transport.DisableKeepAlives = opts.DisableKeepAlives
-	client.Transport = transport
-	return client
+	conn, _, err := dialEndpoint(ctx, d.endpoint, d.options)
+	return conn, err
 }
 
 // DefaultSocketPath returns a per-user socket path under XDG_RUNTIME_DIR when

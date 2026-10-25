@@ -1,29 +1,32 @@
 # daemon
 
-`daemon` is a small, dependency-free (outside tests) Go package for building
-**local background daemons** and the **CLI clients that talk to them**.
+`daemon` is a small Go package for building **local background daemons** and the
+**CLI clients that talk to them**.
 
-It does not impose an application server, a database, a config format, an auth
-policy, or a shutdown policy. Instead it provides the parts that are easy to get
-subtly wrong:
+It does not impose an application protocol, server framework, database, config
+format, auth policy, or shutdown policy. Instead it provides the parts that are
+easy to get subtly wrong:
 
-- endpoint parsing and HTTP clients for **TCP** and **Unix-domain sockets**;
+- endpoint parsing and **dialers** for TCP and Unix-domain sockets;
+- a small **length-prefixed binary handshake** used for liveness probes,
+  discovery, and optional proof-of-possession;
 - atomic **runtime records** (`<prefix>.<pid>.json`) with opaque
   **process-creation identity**;
-- PID-aware **discovery**, liveness probing, and a `Manager` that can
+- PID-aware **discovery**, optional proof, and a `Manager` that can
   **auto-start** a daemon through a caller-supplied `StartFunc`;
 - **three distinct locks**: a start lock, a lifetime owner lock, and a listen
   lock for Unix-socket startup;
-- **proof-of-possession** ping/challenge support so a bearer token is never sent
-  to an unproven endpoint;
 - a verified **`Stop`** that runs the caller's shutdown request and waits for
   exit;
 - platform liveness and termination primitives (`ProcessAlive`, `Kill`).
 
-The package is deliberately careful about process identity: a PID is not
-enough to prove that a recorded daemon is still the same process. An identity
-that cannot be judged never authorizes deleting a record or signaling a
-process.
+The package has **no dependency on `net/http`** and no runtime dependencies
+outside the standard library. Applications own the protocol that follows the
+daemon handshake.
+
+A PID alone never proves that a recorded daemon is still the same process. An
+identity that cannot be judged never authorizes deleting a record or signaling
+a process.
 
 ---
 
@@ -34,16 +37,17 @@ process.
 - [Requirements and installation](#requirements-and-installation)
 - [Quick start: a complete daemon and client](#quick-start-a-complete-daemon-and-client)
 - [Core concepts](#core-concepts)
-  - [Endpoints](#endpoints)
+  - [Endpoints and dialers](#endpoints-and-dialers)
+  - [The daemon handshake](#the-daemon-handshake)
   - [Runtime records](#runtime-records)
   - [Process identity and liveness](#process-identity-and-liveness)
   - [Locks](#locks)
-  - [Ping and proof of possession](#ping-and-proof-of-possession)
+  - [Proof of possession](#proof-of-possession)
   - [Stopping a daemon](#stopping-a-daemon)
 - [Usage guide](#usage-guide)
-  - [Parsing endpoints and building HTTP clients](#parsing-endpoints-and-building-http-clients)
+  - [Parsing endpoints and dialing](#parsing-endpoints-and-dialing)
   - [Serving a daemon](#serving-a-daemon)
-  - [Discovering a running daemon](#discovering-a-running-daemon)
+  - [Probing and discovery](#probing-and-discovery)
   - [Auto-starting with Manager.Ensure](#auto-starting-with-managerensure)
   - [Authenticated daemons with Proof](#authenticated-daemons-with-proof)
   - [Stopping a daemon](#stopping-a-daemon-1)
@@ -66,13 +70,14 @@ process.
 
 | Area | What you get |
 |---|---|
-| Endpoints | `Endpoint` for TCP or Unix sockets, `ParseEndpoint`, loopback/private-address policies, `HTTPClient`, `DefaultSocketPath` |
+| Endpoints | `Endpoint` for TCP or Unix sockets, `ParseEndpoint`, loopback/private-address policies, `Endpoint.Dialer`, `DefaultSocketPath` |
+| Transport | Length-prefixed binary handshake messages; no `net/http` |
 | Runtime state | `RuntimeStore` with atomic writes, fsync, portable file names, `List`/`Read`/`CleanupDead`/`CheckWritable` |
 | Identity | Linux boot-ID + PID-namespace + start-tick identity; Darwin/Windows creation time; exact-match semantics |
 | Discovery | PID-aware `Discover`, `UnreachableError`, service/version filters, custom `Accept` |
 | Auto-start | `Manager` with start-lock serialization, repeated discovery, timeout, caller-owned `StartFunc` |
 | Locks | Start lock, owner lock, listen lock; blocking and nonblocking acquisition |
-| Security | Challenge/response HMAC proof that binds service, version, PID, network and address |
+| Security | Optional challenge/response HMAC proof bound to service, version, PID, network and address |
 | Stop | Endpoint verification, caller shutdown request, exit proof, timeout |
 | Process control | `ProcessAlive`, `ReadProcessIdentity`, identity comparison, `Kill` |
 | Launch | `StartDetached` with platform-appropriate detachment and an `Exited` callback |
@@ -113,20 +118,23 @@ import "github.com/malivvan/daemon"
 ## Quick start: a complete daemon and client
 
 This program builds a daemon (`widgetd`), auto-starts it from the client side,
-calls an endpoint, and stops it. It works on Linux, macOS, and Windows (AF_UNIX).
+speaks a tiny newline protocol over the authenticated connection, and stops it.
+It works on Linux, macOS, and Windows (AF_UNIX).
 
 ```go
 package main
 
 import (
+	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/malivvan/daemon"
@@ -187,27 +195,7 @@ func serve() {
 	}
 
 	rec := daemon.NewRuntimeRecord(service, version, ep)
-	mux := http.NewServeMux()
-	mux.Handle(daemon.DefaultPingPath, daemon.NewPingHandler(daemon.PingHandlerOptions{
-		Service: service,
-		Version: version,
-		PID:     rec.PID,
-	}))
-	mux.HandleFunc("/api/widgets", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"widgets": []string{"sprocket", "cog"}})
-	})
-
-	var server *http.Server
-	mux.HandleFunc("/api/shutdown", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusAccepted)
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = server.Shutdown(ctx)
-		}()
-	})
-	server = &http.Server{Handler: mux}
+	ping := daemon.NewPingHandler(daemon.PingHandlerOptions{Record: rec})
 
 	path, err := store.Write(rec)
 	if err != nil {
@@ -215,18 +203,50 @@ func serve() {
 	}
 	defer os.Remove(path)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	var stopOnce sync.Once
+	stopped := make(chan struct{})
+	shutdown := func() {
+		stopOnce.Do(func() {
+			close(stopped)
+			_ = listener.Close()
+		})
+	}
+
 	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = server.Shutdown(shutdownCtx)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				if err := ping(context.Background(), conn); err != nil {
+					return
+				}
+				line, err := bufio.NewReader(conn).ReadString('\n')
+				if err != nil {
+					return
+				}
+				switch strings.TrimSpace(line) {
+				case "widgets":
+					_, _ = io.WriteString(conn, `{"widgets":["sprocket","cog"]}`+"\n")
+				case "shutdown":
+					_, _ = io.WriteString(conn, "ok\n")
+					shutdown()
+				default:
+					_, _ = io.WriteString(conn, "unknown command\n")
+				}
+			}()
+		}
 	}()
 
-	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		fatal(err)
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stopSignals()
+	select {
+	case <-ctx.Done():
+	case <-stopped:
 	}
+	shutdown()
 }
 
 func status() {
@@ -258,37 +278,34 @@ func status() {
 	}
 	fmt.Printf("daemon pid=%d version=%s at %s\n", info.PID, info.Version, rec.Endpoint().ConfigAddress())
 
-	client := rec.Endpoint().HTTPClient(daemon.HTTPClientOptions{Timeout: 5 * time.Second})
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rec.Endpoint().BaseURL()+"/api/widgets", nil)
+	conn, err := rec.Endpoint().Dialer(daemon.DialerOptions{Timeout: time.Second}).DialContext(ctx)
 	if err != nil {
 		fatal(err)
 	}
-	resp, err := client.Do(req)
+	if _, err := io.WriteString(conn, "widgets\n"); err != nil {
+		_ = conn.Close()
+		fatal(err)
+	}
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	_ = conn.Close()
 	if err != nil {
 		fatal(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	var widgets struct {
-		Widgets []string `json:"widgets"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&widgets); err != nil {
-		fatal(err)
-	}
-	fmt.Println("widgets:", widgets.Widgets)
+	fmt.Println("widgets:", strings.TrimSpace(line))
 
 	err = daemon.Stop(ctx, rec, daemon.StopOptions{
 		Probe: daemon.ProbeOptions{ExpectedService: service},
 		Request: func(ctx context.Context, rec daemon.RuntimeRecord) error {
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, rec.Endpoint().BaseURL()+"/api/shutdown", nil)
+			conn, err := rec.Endpoint().Dialer(daemon.DialerOptions{Timeout: time.Second}).DialContext(ctx)
 			if err != nil {
-				return err
+				return nil // already gone
 			}
-			resp, err := client.Do(req)
-			if err != nil {
-				return nil // the daemon dropped the connection while shutting down
+			defer conn.Close()
+			if _, err := io.WriteString(conn, "shutdown\n"); err != nil {
+				return nil
 			}
-			_ = resp.Body.Close()
-			return nil
+			_, err = bufio.NewReader(conn).ReadString('\n')
+			return err
 		},
 		Timeout: 10 * time.Second,
 	})
@@ -305,56 +322,149 @@ Build and run:
 go mod init example.com/widgetd
 go get github.com/malivvan/daemon
 go build -o widgetd .
-./widgetd          # discovers or auto-starts, calls /api/widgets, then stops it
+./widgetd          # discovers or auto-starts, queries, then stops the daemon
 ./widgetd serve    # run the daemon in the foreground
 ```
 
 What happens:
 
 1. `serve` acquires the **owner lock**, prepares a private socket directory,
-   binds with the **listen lock**, writes an atomic runtime record, and serves
-   the ping endpoint.
-2. `status` calls `Manager.Ensure`, which discovers existing records under the
-   **start lock**, probes them, and launches `./widgetd serve` through
-   `StartDetached` when none is compatible.
-3. `Stop` verifies the endpoint, sends the shutdown request, and waits for the
-   Unix socket to become stale.
-4. The runtime file is removed by the daemon on exit.
-
-> `RefuseEphemeral` is intentionally **not** set in the quick start. Enabling it
-> refuses `go run`/go-build and `*.test` binaries as production daemons; see
-> [`StartDetached`](#starting-a-detached-child).
+   binds with the **listen lock**, writes an atomic runtime record, and starts
+   accepting connections.
+2. Every accepted connection first runs the **daemon handshake**
+   (`ping(context.Background(), conn)`). Only after it succeeds does the
+   application read its own protocol (`widgets` / `shutdown`).
+3. `status` calls `Manager.Ensure`, which discovers existing records under the
+   **start lock**, probes them with the same handshake, and launches
+   `./widgetd serve` through `StartDetached` when none is compatible.
+4. `Endpoint.Dialer` performs the handshake automatically, so the client can
+   write application data as soon as `DialContext` returns.
+5. `Stop` verifies the endpoint, sends the shutdown request, and waits for the
+   listener to disappear.
+6. The runtime file is removed by the daemon on exit.
 
 ---
 
 ## Core concepts
 
-### Endpoints
+### Endpoints and dialers
 
 An `Endpoint` is either:
 
 - `daemon.Endpoint{Network: daemon.NetworkTCP, Address: "127.0.0.1:7373"}`, or
 - `daemon.Endpoint{Network: daemon.NetworkUnix, Address: "/run/user/1000/svc/daemon.sock"}`.
 
-`RuntimeRecord.Address` may also store a Unix socket as `unix:///path`; the
-`RuntimeRecord.Endpoint()` method normalizes it back to `NetworkUnix`.
+`RuntimeRecord.Address` may store a Unix socket as `unix:///path`;
+`RuntimeRecord.Endpoint()` normalizes it back to `NetworkUnix`.
 
 Key helpers:
 
 - `Endpoint.IsUnix()` — true for Unix sockets.
-- `Endpoint.BaseURL()` — `http://localhost` for Unix, `http://host:port` for TCP.
 - `Endpoint.ConfigAddress()` — `unix:///path` or `host:port`, stable for config.
 - `Endpoint.Port()` — TCP port, or `0`.
-- `Endpoint.HTTPClient(...)` — an `http.Client` that dials the endpoint, never
-  uses an environment proxy, and optionally disables keep-alives.
+- `Endpoint.BaseURL()` — `http://localhost` or `http://host:port`, for callers
+  that layer HTTP on top.
 - `Endpoint.Listen()` / `Endpoint.ListenContext(ctx)` — raw bind without the
   Unix stale-socket protections (prefer the package-level `Listen`).
+- `Endpoint.Dialer(opts)` — a `*Dialer` that connects **and performs the daemon
+  handshake** before returning the connection.
+
+```go
+type DialerOptions struct {
+	Timeout   time.Duration // bounds connecting and the handshake
+	KeepAlive time.Duration // TCP keep-alive
+	Proof     *Proof        // optional: authenticate the handshake
+}
+```
+
+```go
+conn, err := ep.Dialer(daemon.DialerOptions{Timeout: time.Second}).DialContext(ctx)
+if err != nil {
+	return err
+}
+defer conn.Close()
+// The handshake is complete; speak the application protocol.
+```
+
+The returned connection has no deadline and is ready for application data. If
+`Proof` is `nil`, the handshake is a plain ping; if it is set, the daemon must
+prove possession of the same key before `DialContext` succeeds.
 
 Address policies for `ParseEndpoint`:
 
 - `daemon.RequireLoopback` — only literal loopback IPs or `localhost`.
 - `daemon.RequireNonPublic` — loopback, RFC 1918 private, link-local, and CGNAT
   (`100.64.0.0/10`) addresses; rejects public and unspecified (`0.0.0.0`, `::`).
+
+### The daemon handshake
+
+Every daemon connection starts with one framed message exchange:
+
+1. The client sends a `PingRequest` (optionally carrying a 32-byte challenge).
+2. The daemon answers with a `PingResponse` (identity, optional proof, or an
+   error).
+
+The frame on the wire is a **4-byte big-endian length** followed by the encoded
+message payload. Frames are capped at **1 MiB**. `PingRequest` and
+`PingResponse` have dependency-free `Encode`/`Decode` methods using only
+`encoding/binary`; the package's dialer and handler add the length prefix.
+
+```go
+type PingRequest struct {
+	Challenge []byte // empty for an unproven ping
+}
+
+func (m PingRequest) Encode() ([]byte, error)
+func (m *PingRequest) Decode(data []byte) error
+
+type PingResponse struct {
+	Info  PingInfo
+	Proof []byte
+	Error string
+}
+
+func (m PingResponse) Encode() ([]byte, error)
+func (m *PingResponse) Decode(data []byte) error
+
+type PingInfo struct {
+	OK      bool
+	Service string
+	Version string
+	PID     int
+}
+```
+
+Payload layouts:
+
+| Message | Layout |
+|---|---|
+| `PingRequest` | type `1`, protocol version `1`, `uint16` challenge length, challenge |
+| `PingResponse` | type `2`, protocol version `1`, status flags, service, version, `int64` PID, proof, error |
+
+Strings and byte fields are length-prefixed with `uint16`. `Decode` rejects
+wrong message types, unsupported versions, truncation, trailing bytes, and
+oversized fields.
+
+Server side: `NewPingHandler` returns a `PingHandler`, a function that handles
+**one accepted connection**:
+
+```go
+type PingHandler func(ctx context.Context, conn net.Conn) error
+
+func NewPingHandler(opts PingHandlerOptions) PingHandler
+
+type PingHandlerOptions struct {
+	Record RuntimeRecord // identity announced and bound by proof
+	Proof  *Proof        // optional: answer proof challenges
+}
+```
+
+The handler reads exactly one request, writes one response, and returns. It
+does **not** close the connection; the caller continues with its own protocol.
+This is why the application must run the handler before reading app data.
+
+`Proof.NewPingHandler(rec)` is a convenience that validates the record's
+identity up front.
 
 ### Runtime records
 
@@ -494,47 +604,43 @@ Unix-socket `Listen` uses the listen lock. If you pass
 `WithListenLockPath(path)` you choose the file; otherwise it uses
 `<socket-path>.lock`.
 
-### Ping and proof of possession
+### Proof of possession
 
-`daemon.NewPingHandler(...)` serves `GET /api/ping` with:
+`Proof` is **optional**. It is used only when a `Proof` is supplied:
 
-```json
-{"ok":true,"service":"widgetd","version":"0.1.0","pid":12345}
-```
+- `DialerOptions.Proof` authenticates the connection during `DialContext`.
+- `DiscoverOptions.Proof` requires proof for every probed record.
+- `StopOptions.Proof` requires proof before the shutdown request.
+- `PingHandlerOptions.Proof` lets the daemon answer challenges; without it, a
+  challenged handshake is refused.
 
-`Probe` requires `ok == true`, and can enforce an expected service. Discovery
-collects `PingInfo` so clients can reject incompatible versions.
+The protocol:
 
-For authenticated daemons, `Proof` adds a challenge/response:
+1. The client generates a 32-byte nonce and sends it as the `PingRequest`
+   challenge.
+2. The daemon computes an HMAC-SHA-256 over a domain separator, the nonce, and
+   the daemon identity: service, version, PID, network, and address.
+3. The client recomputes the HMAC for the endpoint it dialed and the identity in
+   the response, and rejects a missing or mismatched proof.
 
-- The server creates `proof, _ := daemon.NewProof(token)` and registers
-  `proof.NewPingHandler(rec)` under `daemon.DefaultPingPath`.
-- The client creates its own `Proof` from the same token and puts it in
-  `DiscoverOptions.Proof` (or calls `proof.Probe(ctx, rec, opts)` directly).
-- The client sends a random nonce; the server answers with an HMAC over the
-  nonce and the daemon's service, version, PID, network, and address. The token
-  is never transmitted. A response that does not bind the identity in the ping
-  response is rejected.
-- Unchallenged requests still get the ordinary readiness response.
-- `Proof` redacts its key in `%v`, `%+v`, and `%#v` formatting.
+The shared token is never transmitted. `Proof` redacts its key in `%v`, `%+v`,
+and `%#v` formatting. A proof only establishes possession of the key and the
+bound identity; it is not an application authorization token.
 
-**Ordering rule:** do not send a bearer credential until discovery/proof has
-succeeded for that endpoint. A custom `FindFunc` must preserve this ordering and
-can use `Proof.Probe` directly.
+**Ordering rule:** do not send an application credential until the handshake has
+succeeded for that endpoint. A custom `FindFunc` must preserve this ordering.
 
 ### Stopping a daemon
 
 `Stop` is a client-side, verified shutdown sequence:
 
 1. Requires a positive PID and a `Request` function.
-2. Without `Exited`, a stale Unix socket confirms exit before any request.
-3. TCP records require `Proof`; Unix records may use a plain PID ping.
-4. Probes the endpoint and verifies the answering PID (when no proof is used).
-5. Calls `Request` only after verification.
-6. Waits for exit. With `Exited`, only a `true` result confirms exit; without
+2. Without `Exited`, a refused connection confirms exit before any request.
+3. Probes the endpoint with the handshake, using `Proof` only if provided.
+4. Calls `Request` only after verification.
+5. Waits for exit. With `Exited`, only a `true` result confirms exit; without
    it, connection refusal or a different positive PID ends the wait.
-7. Sends **no signals** and removes **no files**. Deleting the runtime record is
-   the caller's (or the daemon's) job.
+6. Sends **no signals** and removes **no files**.
 
 `StopOptions.Timeout` defaults to 30 seconds. A connection dropped during the
 shutdown request should be treated as success by returning `nil` from
@@ -544,7 +650,7 @@ shutdown request should be treated as success by returning `nil` from
 
 ## Usage guide
 
-### Parsing endpoints and building HTTP clients
+### Parsing endpoints and dialing
 
 ```go
 func parseEndpoints() {
@@ -561,23 +667,14 @@ func parseEndpoints() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(ep.BaseURL(), ep.Port())
+	fmt.Println(ep.ConfigAddress(), ep.Port())
 }
 
-func newHTTPClient() {
-	ep := daemon.Endpoint{Network: daemon.NetworkUnix, Address: "/run/user/1000/tool/daemon.sock"}
-	client := ep.HTTPClient(daemon.HTTPClientOptions{
-		Timeout:               5 * time.Second,
-		ResponseHeaderTimeout: time.Second,
-		DisableKeepAlives:     true,
-	})
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, ep.BaseURL()+"/api/status", nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if _, err := client.Do(req); err != nil {
-		fmt.Println("request failed:", err)
-	}
+func dialEndpoint(ep daemon.Endpoint) (net.Conn, error) {
+	return ep.Dialer(daemon.DialerOptions{
+		Timeout:   time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext(context.Background())
 }
 ```
 
@@ -600,11 +697,31 @@ The quick-start `serve` function is the recommended shape:
 2. `store.AcquireOwnerLock(ctx)` for the writable lifetime.
 3. `daemon.Listen(ctx, ep, daemon.WithRuntimeStore(store))` to serialize Unix
    stale-socket cleanup and bind.
-4. Register `daemon.NewPingHandler` (and `Proof.NewPingHandler` when
-   authenticated).
+4. Build a `PingHandler` with `daemon.NewPingHandler` (or
+   `Proof.NewPingHandler` when proof is configured).
 5. `store.Write(daemon.NewRuntimeRecord(service, version, ep))` **after** the
    listener is bound.
-6. Serve; remove the runtime file on exit.
+6. Accept connections, run the ping handler, then run the application protocol.
+7. Close the listener to stop accepting; remove the runtime file on exit.
+
+```go
+ping := daemon.NewPingHandler(daemon.PingHandlerOptions{Record: rec})
+
+for {
+	conn, err := listener.Accept()
+	if err != nil {
+		return
+	}
+	go func() {
+		defer conn.Close()
+		if err := ping(ctx, conn); err != nil {
+			return
+		}
+		// The connection is authenticated (when proof is configured).
+		// Read and write the application protocol here.
+	}()
+}
+```
 
 `daemon.Listen` for Unix sockets:
 
@@ -617,7 +734,7 @@ The quick-start `serve` function is the recommended shape:
 For TCP endpoints, `Listen` delegates to the normal network listener and the
 listen lock is not used.
 
-### Discovering a running daemon
+### Probing and discovery
 
 ```go
 func discover(ctx context.Context, store daemon.RuntimeStore) {
@@ -646,6 +763,10 @@ func discover(ctx context.Context, store daemon.RuntimeStore) {
 	fmt.Println(rec.PID, info.Service, info.Version)
 }
 ```
+
+`daemon.Probe(ctx, ep, opts)` performs a plain handshake and returns `PingInfo`.
+`(*Proof).Probe(ctx, rec, opts)` performs a proven handshake and also verifies
+that the response identity matches `rec`.
 
 Important details:
 
@@ -695,18 +816,22 @@ Behavior:
 
 ### Authenticated daemons with Proof
 
-Complete server and client:
+Complete server and client (the same shape as the quick start, with proof):
 
 ```go
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
+	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/malivvan/daemon"
@@ -750,10 +875,6 @@ func endpoint() daemon.Endpoint {
 	return daemon.Endpoint{Network: daemon.NetworkUnix, Address: path}
 }
 
-func authorized(r *http.Request, token []byte) bool {
-	return r.Header.Get("Authorization") == "Bearer "+string(token)
-}
-
 func serve(token []byte) {
 	store := runtimeStore()
 	proof, err := daemon.NewProof(token)
@@ -771,40 +892,56 @@ func serve(token []byte) {
 	if err != nil {
 		fatal(err)
 	}
-	mux := http.NewServeMux()
-	mux.Handle(daemon.DefaultPingPath, ping)
-	mux.HandleFunc("/api/secret", func(w http.ResponseWriter, r *http.Request) {
-		if !authorized(r, token) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		_, _ = w.Write([]byte("classified\n"))
-	})
-
-	var server *http.Server
-	mux.HandleFunc("/api/shutdown", func(w http.ResponseWriter, r *http.Request) {
-		if !authorized(r, token) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		w.WriteHeader(http.StatusAccepted)
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = server.Shutdown(ctx)
-		}()
-	})
-	server = &http.Server{Handler: mux}
-
 	path, err := store.Write(rec)
 	if err != nil {
 		fatal(err)
 	}
 	defer os.Remove(path)
 
-	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		fatal(err)
+	var stopOnce sync.Once
+	stopped := make(chan struct{})
+	shutdown := func() {
+		stopOnce.Do(func() {
+			close(stopped)
+			_ = listener.Close()
+		})
 	}
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				if err := ping(context.Background(), conn); err != nil {
+					return
+				}
+				line, err := bufio.NewReader(conn).ReadString('\n')
+				if err != nil {
+					return
+				}
+				switch strings.TrimSpace(line) {
+				case "secret":
+					_, _ = io.WriteString(conn, "classified\n")
+				case "shutdown":
+					_, _ = io.WriteString(conn, "ok\n")
+					shutdown()
+				default:
+					_, _ = io.WriteString(conn, "unknown command\n")
+				}
+			}()
+		}
+	}()
+
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stopSignals()
+	select {
+	case <-ctx.Done():
+	case <-stopped:
+	}
+	shutdown()
 }
 
 func call(token []byte) {
@@ -840,36 +977,43 @@ func call(token []byte) {
 		fatal(err)
 	}
 
-	// Only after discovery succeeded is the endpoint proven; the bearer token
-	// may now be sent.
-	client := rec.Endpoint().HTTPClient(daemon.HTTPClientOptions{Timeout: 5 * time.Second})
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rec.Endpoint().BaseURL()+"/api/secret", nil)
+	// Discovery proved the endpoint; the connection is authenticated by the
+	// same handshake before any application data is exchanged.
+	conn, err := rec.Endpoint().Dialer(daemon.DialerOptions{
+		Timeout: time.Second,
+		Proof:   proof,
+	}).DialContext(ctx)
 	if err != nil {
 		fatal(err)
 	}
-	req.Header.Set("Authorization", "Bearer "+string(token))
-	resp, err := client.Do(req)
+	if _, err := io.WriteString(conn, "secret\n"); err != nil {
+		_ = conn.Close()
+		fatal(err)
+	}
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	_ = conn.Close()
 	if err != nil {
 		fatal(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	fmt.Println("response status:", resp.Status)
+	fmt.Println("response:", strings.TrimSpace(line))
 
 	err = daemon.Stop(ctx, rec, daemon.StopOptions{
 		Probe: daemon.ProbeOptions{ExpectedService: service},
 		Proof: proof,
 		Request: func(ctx context.Context, rec daemon.RuntimeRecord) error {
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, rec.Endpoint().BaseURL()+"/api/shutdown", nil)
+			conn, err := rec.Endpoint().Dialer(daemon.DialerOptions{
+				Timeout: time.Second,
+				Proof:   proof,
+			}).DialContext(ctx)
 			if err != nil {
-				return err
+				return nil // already gone
 			}
-			req.Header.Set("Authorization", "Bearer "+string(token))
-			resp, err := client.Do(req)
-			if err != nil {
-				return nil // the daemon dropped the connection while shutting down
+			defer conn.Close()
+			if _, err := io.WriteString(conn, "shutdown\n"); err != nil {
+				return nil
 			}
-			_ = resp.Body.Close()
-			return nil
+			_, err = bufio.NewReader(conn).ReadString('\n')
+			return err
 		},
 		Timeout: 10 * time.Second,
 	})
@@ -880,16 +1024,18 @@ func call(token []byte) {
 }
 ```
 
-Invoke with `SECRETD_TOKEN=... ./secretd`.
+Invoke with `SECRETD_TOKEN=... ./secretd`. The daemon refuses challenged
+handshakes from clients that cannot prove the same token; an unproven client can
+still perform a plain ping unless the application chooses to require proof.
 
-If the store is shared with an endpoint reachable by other users, keep the
-token out of `RuntimeRecord.Metadata`; records are mode `0644` (the directory is
-private, but metadata is not a secret store).
+If the endpoint is reachable by other users, keep application secrets out of
+`RuntimeRecord.Metadata`; records are mode `0644` (the directory is private, but
+metadata is not a secret store).
 
 ### Stopping a daemon
 
-TCP records require a `Proof`; Unix records may omit it. To wait for the actual
-process to exit (not just for the listener to close), supply `Exited`:
+`Proof` is optional. To wait for the actual process to exit (not just for the
+listener to close), supply `Exited`:
 
 ```go
 func stopWithExited(ctx context.Context, rec daemon.RuntimeRecord) {
@@ -903,16 +1049,13 @@ func stopWithExited(ctx context.Context, rec daemon.RuntimeRecord) {
 		Exited:  exited,
 		Timeout: 30 * time.Second,
 		Request: func(ctx context.Context, rec daemon.RuntimeRecord) error {
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, rec.Endpoint().BaseURL()+"/api/shutdown", nil)
+			conn, err := rec.Endpoint().Dialer(daemon.DialerOptions{Timeout: time.Second}).DialContext(ctx)
 			if err != nil {
-				return err
+				return nil // the daemon dropped the connection while shutting down
 			}
-			resp, err := rec.Endpoint().HTTPClient(daemon.HTTPClientOptions{Timeout: 5 * time.Second}).Do(req)
-			if err != nil {
-				return nil
-			}
-			_, _ = io.Copy(io.Discard, resp.Body)
-			return resp.Body.Close()
+			defer conn.Close()
+			_, err = io.WriteString(conn, "shutdown\n")
+			return err
 		},
 	})
 	if err != nil {
@@ -1084,9 +1227,8 @@ Behavior:
 | `RequireNonPublic(addr string) error` | Reject public and unspecified TCP hosts. |
 | `DefaultSocketPath(service string) string` | Per-user private Unix socket path, or `""`. |
 | `Listen(ctx, ep Endpoint, options ...ListenOption) (net.Listener, error)` | Bind with Unix stale-socket protection. |
-| `NewPingHandler(opts PingHandlerOptions) http.Handler` | Reference `GET /api/ping` handler. |
-| `Probe(ctx, ep Endpoint, opts ProbeOptions) (PingInfo, error)` | Probe an endpoint. |
-| `ProbeHTTP(ctx, client *http.Client, baseURL string, opts ProbeOptions) (PingInfo, error)` | Probe an arbitrary base URL. |
+| `NewPingHandler(opts PingHandlerOptions) PingHandler` | Handshake responder for one accepted connection. |
+| `Probe(ctx, ep Endpoint, opts ProbeOptions) (PingInfo, error)` | Plain handshake probe. |
 | `Discover(ctx, store RuntimeStore, opts DiscoverOptions) (RuntimeRecord, PingInfo, bool, error)` | Runtime-file discovery. |
 | `StartDetached(ctx, opts StartDetachedOptions) error` | Start a detached child and reap it. |
 | `IsEphemeralExecutable(exe string) bool` | Detect test/go-build binaries. |
@@ -1112,12 +1254,46 @@ type Endpoint struct {
 
 | Method | Description |
 |---|---|
+| `Dialer(DialerOptions) *Dialer` | Dial and perform the daemon handshake. |
 | `IsUnix()` | Network is `unix`. |
-| `BaseURL()` | `http://localhost` or `http://host:port`. |
 | `ConfigAddress()` | `unix:///path` or `host:port`. |
+| `BaseURL()` | `http://localhost` or `http://host:port`, for HTTP layering. |
 | `Port()` | TCP port, otherwise `0`. |
-| `HTTPClient(HTTPClientOptions)` | Client that dials this endpoint without a proxy. |
 | `Listen()` / `ListenContext(ctx)` | Raw listener bind (prefer `daemon.Listen`). |
+
+### `Dialer` and `DialerOptions`
+
+```go
+type DialerOptions struct {
+	Timeout   time.Duration
+	KeepAlive time.Duration
+	Proof     *Proof
+}
+```
+
+| Field | Description |
+|---|---|
+| `Timeout` | Bounds connecting and the handshake. Zero relies on the context. |
+| `KeepAlive` | TCP keep-alive period passed to `net.Dialer`. |
+| `Proof` | Optional proof of possession during the handshake. |
+
+| Method | Description |
+|---|---|
+| `(*Dialer).DialContext(ctx) (net.Conn, error)` | Connect, handshake, and return a connection ready for the application protocol. |
+| `(*Dialer).Endpoint() Endpoint` | The endpoint this dialer targets. |
+
+### Handshake messages
+
+| Type | Fields | Methods |
+|---|---|---|
+| `PingRequest` | `Challenge []byte` | `Encode() ([]byte, error)`, `Decode([]byte) error` |
+| `PingResponse` | `Info PingInfo`, `Proof []byte`, `Error string` | `Encode() ([]byte, error)`, `Decode([]byte) error` |
+| `PingInfo` | `OK bool`, `Service string`, `Version string`, `PID int` | — |
+| `PingHandlerOptions` | `Record RuntimeRecord`, `Proof *Proof` | — |
+| `PingHandler` | `func(ctx context.Context, conn net.Conn) error` | — |
+
+`Encode` writes the payload only. The package frames it with a 4-byte
+big-endian length when using `net.Conn`. Frames are limited to 1 MiB.
 
 ### `RuntimeRecord`
 
@@ -1177,19 +1353,19 @@ type RuntimeStore struct {
 
 | Type | Fields |
 |---|---|
-| `ProbeOptions` | `Path`, `ExpectedService`, `Timeout` (default 1s) |
+| `ProbeOptions` | `ExpectedService`, `Timeout` (default 1s) |
 | `DiscoverOptions` | `Probe`, `Proof`, `RequirePIDAlive`, `Accept` |
 
 `UnreachableError` carries `Record`, `Endpoint`, and `Err`, and unwraps to
-`ErrDaemonUnreachable` plus the probe error.
+`ErrDaemonUnreachable` plus the handshake error.
 
 ### `Proof`
 
 | Method | Description |
 |---|---|
 | `NewProof(key)` | Copies the shared token. Empty keys are rejected. |
-| `(*Proof).NewPingHandler(rec)` | Ping handler that answers proof challenges. |
-| `(*Proof).Probe(ctx, rec, opts)` | Probe and verify proof-of-possession. |
+| `(*Proof).NewPingHandler(rec)` | Handshake handler that answers proof challenges. |
+| `(*Proof).Probe(ctx, rec, opts)` | Probe and verify proof-of-possession plus the record identity. |
 | `(Proof).Format` | Redacts the key in formatting. |
 
 ### `StopOptions`
@@ -1197,7 +1373,7 @@ type RuntimeStore struct {
 | Field | Description |
 |---|---|
 | `Probe` | Liveness probe options. |
-| `Proof` | Required for TCP records; optional for Unix. |
+| `Proof` | Optional proof before the request. |
 | `Request` | Shutdown request; called only after verification. |
 | `Exited` | Optional exit proof; only `true` confirms exit. |
 | `Timeout` | Whole-call bound; default 30s. |
@@ -1251,16 +1427,14 @@ daemon.Listen(ctx, ep,
 | Type | Fields |
 |---|---|
 | `ParseEndpointOptions` | `DefaultTCPAddress`, `DefaultUnixPath`, `TCPPolicy` |
-| `HTTPClientOptions` | `Timeout`, `ResponseHeaderTimeout`, `DisableKeepAlives` |
-| `PingHandlerOptions` | `Service`, `Version`, `PID` (`0` means the current process) |
+| `PingHandlerOptions` | `Record`, `Proof` |
 | `DiscoverOptions` | `Probe`, `Proof`, `RequirePIDAlive`, `Accept` |
-| `ProbeOptions` | `Path` (default `/api/ping`), `ExpectedService`, `Timeout` (default 1s) |
+| `ProbeOptions` | `ExpectedService`, `Timeout` (default 1s) |
 | `StopOptions` | `Probe`, `Proof`, `Request`, `Exited`, `Timeout` (default 30s) |
 | `StartDetachedOptions` | `Executable`, `Args`, `Dir`, `Env`, `Stdout`, `Stderr`, `RefuseEphemeral`, `AfterStart`, `Exited` |
 
 `ListenOption` values are `WithRuntimeStore(store)`,
 `WithListenLockPath(path)`, and `WithStaleSocketProbeTimeout(duration)`.
-
 
 ---
 
@@ -1269,12 +1443,16 @@ daemon.Listen(ctx, ep,
 | Error | Meaning |
 |---|---|
 | `ErrDaemonUnreachable` | A live record's endpoint could not be proved usable. |
-| `*UnreachableError` | Carries `Record`, `Endpoint`, and the underlying probe error. |
-| `ErrStopProofRequired` | A TCP stop needs `StopOptions.Proof`; exit was not confirmed. |
+| `*UnreachableError` | Carries `Record`, `Endpoint`, and the underlying handshake error. |
 | `ErrExitUnconfirmed` | The process is gone but exit evidence is inconclusive. |
-| `context.Canceled` / `context.DeadlineExceeded` | Caller bounds were reached while discovering, starting, or stopping. |
+| `context.Canceled` / `context.DeadlineExceeded` | Caller bounds were reached while dialing, probing, starting, or stopping. |
 | `daemon not running` | `Ensure` had no `Start` and discovery found nothing. |
 | `daemon failed to start within ...` | Polling did not observe a compatible daemon before the deadline. |
+| `dial daemon at ...` | Connecting to the endpoint failed. |
+| `daemon handshake: ...` | The daemon answered with a protocol error (including proof configuration). |
+| `daemon ping returned ok=false` | The handshake response was not OK. |
+| `daemon proof mismatch` / `daemon proof response is missing or malformed` | Proof verification failed. |
+| `daemon message size ... is invalid` / `malformed daemon message` | Framing or payload decoding failed. |
 | `daemon lock path ... must be absolute` | Lock paths from options must be absolute. |
 | `runtime dir ... must be absolute` | `RuntimeStore.Dir` must be absolute. |
 | `runtime prefix ... must be a portable basename` | Invalid runtime prefix. |
@@ -1282,7 +1460,6 @@ daemon.Listen(ctx, ep,
 | `validate unix socket dir: ...` | The socket directory is not private/current-user-owned. |
 | `refusing to remove non-socket path ...` | A non-socket exists at the Unix socket path. |
 | `daemon already listening on unix socket ...` | A live listener owns the path. |
-| `daemon proof ...` | Missing, malformed, mismatched, or identity-unbound proof. |
 
 When inspecting an error from discovery, prefer:
 
@@ -1299,25 +1476,33 @@ if errors.Is(err, daemon.ErrDaemonUnreachable) {
 
 ## Security notes
 
-1. **Prove before you authenticate.** Do not send a bearer token to an endpoint
-   until `Discover`/`Ensure` with `DiscoverOptions.Proof` (or `Proof.Probe`)
-   has succeeded. The proof binds the daemon's service, version, PID, network,
-   and address without sending the token.
-2. **Treat unknown identity as no authority.** A record with an unreadable or
+1. **Prove before you authorize.** If the daemon is configured with a `Proof`,
+   require it in discovery and on application dials. Do not send application
+   credentials until the handshake succeeds (`Manager.Find`/`Ensure`,
+   `Proof.Probe`, or `DialerOptions.Proof`).
+2. **Proof is opt-in.** Without a supplied `Proof`, the handshake is a plain
+   ping, and a daemon without `PingHandlerOptions.Proof` refuses challenges. An
+   unproven client can still ping an unproven daemon; that is a configuration
+   choice, not an authorization decision.
+3. **Proof is not application auth.** It proves possession of a shared key and
+   binds the identity/endpoint; it does not authorize commands. Keep the
+   application's own authorization in the application protocol.
+4. **Treat unknown identity as no authority.** A record with an unreadable or
    foreign identity is kept and probed, not deleted or signaled. `Kill` does not
    verify identity; do that yourself.
-3. **Runtime directories are private.** On Unix, `0700`, current-user-owned,
+5. **Runtime directories are private.** On Unix, `0700`, current-user-owned,
    no symlinks. On Windows, a protected DACL limited to the current user,
    `SYSTEM`, and built-in `Administrators`, with reparse points rejected.
-4. **Runtime files are `0644`.** Do not put secrets in `Metadata`; the directory
+6. **Runtime files are `0644`.** Do not put secrets in `Metadata`; the directory
    protects them, not the file mode.
-5. **No public binds by default.** Use `RequireLoopback`/`RequireNonPublic` and
+7. **No public binds by default.** Use `RequireLoopback`/`RequireNonPublic` and
    keep TCP endpoints local.
-6. **Unix socket cleanup is conservative.** Only a path that is a socket and
+8. **Unix socket cleanup is conservative.** Only a path that is a socket and
    probes as stale is removed, and only while holding the listen lock.
-7. **Locks are advisory across processes.** They coordinate cooperating
-   callers; they do not sandbox hostile processes that can write the runtime
-   directory.
+9. **The handshake preface is mandatory for application data.** A server that
+   skips the `PingHandler` will read application bytes as a handshake frame, and
+   a client that connects without `Endpoint.Dialer` must implement the handshake
+   itself.
 
 ---
 
@@ -1382,9 +1567,10 @@ GOOS=windows GOARCH=amd64 go vet ./...
 GOOS=freebsd GOARCH=amd64 go build ./...
 ```
 
-The test suite uses local HTTP servers, temporary directories, per-test runtime
-stores, and re-executed test binaries for detached/kill/lock scenarios. It does
-not require elevated privileges or external daemons.
+The test suite uses local listeners, `net.Pipe` for handshake unit tests,
+temporary directories, per-test runtime stores, and re-executed test binaries
+for detached/kill/lock scenarios. It does not require elevated privileges or
+external daemons, and it does not import `net/http`.
 
 One Unix test (`TestListenUnixRejectsSharedSocketDirectoryEvenWithStoreLock`)
 deliberately verifies that a socket in a shared directory is rejected. It
@@ -1402,10 +1588,10 @@ Test-only helpers (for example `HoldLockForTest`, `EnsurePrivateDirForTest`,
 
 | File | Responsibility |
 |---|---|
-| `endpoint.go` | Package doc, `Endpoint`, parsing/policies, HTTP clients, `Listen`, `DefaultSocketPath` |
+| `endpoint.go` | Package doc, `Endpoint`, parsing/policies, `Dialer`, `Listen`, `DefaultSocketPath` |
 | `runtime.go` | Runtime records/store, atomic writes, portable names |
 | `lock.go` | Start/owner locks, cross-process file lock, local semaphore |
-| `probe.go` | Ping, probe, discovery, proof-of-possession |
+| `probe.go` | Handshake messages, ping handler, probe, discovery, proof |
 | `daemon.go` | `Manager`, `StartDetached`, `Stop` |
 | `process.go` | Identity types/scopes, liveness helpers, `Kill` |
 | `process_linux.go` | Linux process identity |
@@ -1424,8 +1610,14 @@ unexported behavior).
 
 ## Compatibility and upgrade notes
 
-- Runtime records are JSON. Unknown fields are ignored on read; new fields are
-  additive.
+- The handshake is a new binary protocol (version `1`). It is **not**
+  wire-compatible with the package's former HTTP-based ping. Upgrade servers and
+  clients together.
+- `Endpoint.Dialer` replaces the former `HTTPClient`; `DialerOptions` replaces
+  `HTTPClientOptions`. The package no longer imports `net/http`.
+- `Stop` no longer requires proof for TCP records. Supply `StopOptions.Proof`
+  when the daemon uses proof; otherwise the handshake is a plain PID ping.
+- Runtime record files and process-identity encodings are unchanged.
 - Linux records use `process_identity_v2`. The legacy `process_identity` field
   is left empty on Linux so older clients treat the record as unverifiable
   rather than deleting it.
@@ -1441,11 +1633,29 @@ unexported behavior).
 
 ## Troubleshooting
 
+**`daemon handshake: proof is not configured`.**
+The client sent a challenge but the daemon's ping handler has no `Proof`.
+Configure `PingHandlerOptions.Proof` on the server or stop sending
+`DialerOptions.Proof`/`DiscoverOptions.Proof` from the client.
+
+**`daemon proof mismatch` or `daemon proof response is missing or malformed`.**
+The client and server have different tokens, or a middlebox/relay rewrote the
+identity. Ensure both sides use the same key and that `RuntimeRecord.Address`
+is the address clients actually dial (the proof binds it).
+
+**`daemon ping returned ok=false` / `daemon handshake: ...`.**
+The daemon answered but rejected the request (protocol version, malformed
+challenge, missing proof configuration, or invalid record identity). Check both
+sides run the same package version.
+
+**The application protocol reads garbage.**
+The server must run the handshake handler before reading application data. If
+you bypass `Endpoint.Dialer` on the client, implement the same preface; the
+server's first read is the handshake frame.
+
 **`daemon is unreachable` although the PID is alive.**
-The endpoint could not be proved (transport, HTTP status, `ok != true`, wrong
+The endpoint could not be proved (transport failure, handshake error, wrong
 service, or failed proof). Inspect `UnreachableError.Endpoint` and `.Err`.
-Check the runtime record's address and that the daemon is serving
-`/api/ping`.
 
 **`Ensure` returns `ErrDaemonUnreachable` and does not start a daemon.**
 That is intentional: a live record exists but cannot be verified, so starting a
@@ -1469,10 +1679,6 @@ than pointing at a shared directory.
 **`refusing to remove non-socket path`.**
 Something else is at the socket path. Move or delete it yourself; the package
 will not remove a path it cannot identify as a stale socket.
-
-**`Stop` returns `ErrStopProofRequired`.**
-TCP records require `StopOptions.Proof`. Construct the same proof the server
-uses and pass it in.
 
 **`Stop` returns `ErrExitUnconfirmed`.**
 The process is gone but exit evidence was inconclusive. Supply
